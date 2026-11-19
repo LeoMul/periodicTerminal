@@ -452,7 +452,7 @@ def draw(win, st):
         put(win, 0, 0, "terminal too small (need %dx%d)" % (MIN_W, MIN_H))
         win.refresh()
         return
-    cw, rh,y_gap, x0 = metrics(h, w)
+    cw, rh, y_gap, x0 = metrics(h, w)
     top = 1
     put(win, 0, x0, "PERIODIC", curses.A_BOLD)
     put(win, 0, x0 + 10, "? help  :q quit  hjkl w/b  / search  Enter levels  c colour", curses.A_DIM)
@@ -471,7 +471,7 @@ def draw(win, st):
         if z in st["matches"] and not sel:
             attr = (attr & ~curses.A_DIM) | curses.A_UNDERLINE | curses.A_BOLD
         quiet = attr if sel else (attr & ~curses.A_BOLD) | curses.A_DIM
-        y, x = cell_y(r, top, rh,y_gap), x0 + (c - 1) * cw
+        y, x = cell_y(r, top, rh, y_gap), x0 + (c - 1) * cw
         fw = max(2, cw - 1)                                 # one-column gap between cells
         if rh == 1:
             lines = [(sym, attr)]
@@ -484,12 +484,11 @@ def draw(win, st):
             put(win, y + i, x, t.center(fw), a)
 
     for (r, c, s) in ((6, 3, "*"), (7, 3, "**"), (9, 2, "*"), (10, 2, "**")):
-        y = cell_y(r, top, rh,y_gap) + (0 if rh == 1 else 1)
+        y = cell_y(r, top, rh, y_gap) + (0 if rh == 1 else 1)
         put(win, y, x0 + (c - 1) * cw, s.center(cw), curses.A_DIM)
 
-    #sy = top + 9 * rh + 1
-    last_y = cell_y(10, top, rh, y_gap) + rh
-    sy = max(top + 9 * rh + 1, last_y + 1)
+    last_bottom = cell_y(10, top, rh, y_gap) + rh
+    sy = last_bottom + 1
     put(win, sy, x0, "-" * min(w - 2 - x0, 18 * cw), curses.A_DIM)
     z = st["cur"]
     sym, name, mass, period, group, block = info(z)
