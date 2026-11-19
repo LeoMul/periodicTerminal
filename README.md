@@ -1,9 +1,7 @@
 # pt-term
 
-This is completely vibecoded. By design, I have not looked at any of the code by hand. 
-
 A vim-inspired periodic table and NIST Atomic Spectra Database (ASD) energy-level viewer for your terminal, built with Python `curses`[cite: 1].
-
+This is completely vibecoded. By design, I have not looked at any of the code by hand.
 ## Features
 
 - **Full 118-element table** with categories, electron configurations (including exceptions), block/group/period metadata, and lanthanide/actinide placement[cite: 1].
