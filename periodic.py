@@ -395,22 +395,31 @@ def init_fills():
         curses.init_pair(FILL_BASE + i + 1, 231 if lum < 150 else 16, nearest_xterm(mix))
 
 
+# Typical terminal character height : width ratio (~2.0; tweak e.g. 1.8 or 2.2 to match your font)
+CHAR_ASPECT = 2.0
+
+
 def metrics(h, w):
-    """Scale the grid to the terminal with a 1-row period gap and ~square visual cells."""
-    # Reserve rows: 1 header + 1 lanthanide gap + 1 separator + 6 info lines + 1 status line = ~10
-    # Plus 6 inter-period gaps between rows 1..7 -> 16 rows overhead
+    """Scale the grid with equal period gaps and near-square visual cells."""
     gap_y = 1 if h >= 26 else 0
-    rh = max(1, min(3, (h - 10 - 6 * gap_y) // 9))
+    # Total vertical rows needed for 9 grid rows (1..7 + 9..10) + 6 period gaps + 1 lanthanide separator
+    # Leave ~9 rows for top bar + bottom info/status block
+    avail_h = max(9, h - 9 - 6 * gap_y - 1)
+    rh = max(1, min(3, avail_h // 9))
 
-    # Visual aspect ratio: 1 terminal row ≈ 2 terminal columns (with 1-col horizontal gap)
-    # Target cell footprint (including 1-col gap): ~2*rh + 1 wide by rh tall
-    aspect_cw = 2 * rh + 1
+    # Each cell has `fw` drawn columns + 1 column gap = `cw` total columns.
+    # For a square visual box: fw * char_w ≈ rh * char_h  =>  fw ≈ rh * CHAR_ASPECT
+    target_fw = max(2, round(rh * CHAR_ASPECT))
+    target_cw = target_fw + 1
+
     max_cw = max(3, (w - 2) // 18)
-    cw = max(3, min(max_cw, aspect_cw))
+    cw = min(max_cw, target_cw)
 
-    # If extra horizontal space exists, allow slightly wider cells up to 3*rh + 2
-    if max_cw > aspect_cw:
-        cw = min(max_cw, max(aspect_cw, min(3 * rh + 2, (w - 2) // 18)))
+    # If the terminal is much wider than it is tall, keep cells near-square instead of stretching wide
+    if cw < target_cw and max_cw >= 3:
+        # Shrink rh if needed so cells stay square-ish rather than tall skinny strips
+        rh_from_w = max(1, min(3, round((cw - 1) / CHAR_ASPECT)))
+        rh = min(rh, rh_from_w)
 
     x0 = max(1, (w - 18 * cw) // 2)
     return cw, rh, gap_y, x0
