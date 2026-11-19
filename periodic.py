@@ -396,28 +396,41 @@ def init_fills():
 
 
 def metrics(h, w):
-    """Scale the grid to the terminal: cell width, cell height, left margin."""
-    cw_w = max(3, (w - 2) // 18)
-    rh_h = max(1, min(3, (h - 10) // 9))
-    rh = min(rh_h, max(1, (cw_w - 1) // 2))
-    cw = max(3, min(cw_w, 3 * rh + 3))
+    """Scale the grid to the terminal with a 1-row period gap and ~square visual cells."""
+    # Reserve rows: 1 header + 1 lanthanide gap + 1 separator + 6 info lines + 1 status line = ~10
+    # Plus 6 inter-period gaps between rows 1..7 -> 16 rows overhead
+    gap_y = 1 if h >= 26 else 0
+    rh = max(1, min(3, (h - 10 - 6 * gap_y) // 9))
+
+    # Visual aspect ratio: 1 terminal row ≈ 2 terminal columns (with 1-col horizontal gap)
+    # Target cell footprint (including 1-col gap): ~2*rh + 1 wide by rh tall
+    aspect_cw = 2 * rh + 1
+    max_cw = max(3, (w - 2) // 18)
+    cw = max(3, min(max_cw, aspect_cw))
+
+    # If extra horizontal space exists, allow slightly wider cells up to 3*rh + 2
+    if max_cw > aspect_cw:
+        cw = min(max_cw, max(aspect_cw, min(3 * rh + 2, (w - 2) // 18)))
+
     x0 = max(1, (w - 18 * cw) // 2)
-    return cw, rh, x0
+    return cw, rh, gap_y, x0
 
 
-def cell_y(r, top, rh):
+def cell_y(r, top, rh, gap_y=1):
     if r <= 7:
-        return top + (r - 1) * rh
-    return top + 7 * rh + 1 + (r - 9) * rh
+        return top + (r - 1) * (rh + gap_y)
+    # Lanthanides (row 9) and actinides (row 10) sit below a separator gap after period 7
+    base_after_p7 = top + 7 * rh + 6 * gap_y + 1
+    return base_after_p7 + (r - 9) * (rh + gap_y)
 
 
 def hit_cell(win, mx, my):
     h, w = win.getmaxyx()
     if h < MIN_H or w < MIN_W:
         return None
-    cw, rh, x0 = metrics(h, w)
+    cw, rh, gap_y, x0 = metrics(h, w)
     for z, (r, c) in POS.items():
-        y, x = cell_y(r, 1, rh), x0 + (c - 1) * cw
+        y, x = cell_y(r, 1, rh,gap_y), x0 + (c - 1) * cw
         if y <= my < y + rh and x <= mx < x + cw:
             return z
     return None
@@ -430,7 +443,7 @@ def draw(win, st):
         put(win, 0, 0, "terminal too small (need %dx%d)" % (MIN_W, MIN_H))
         win.refresh()
         return
-    cw, rh, x0 = metrics(h, w)
+    cw, rh,y_gap, x0 = metrics(h, w)
     top = 1
     put(win, 0, x0, "PERIODIC", curses.A_BOLD)
     put(win, 0, x0 + 10, "? help  :q quit  hjkl w/b  / search  Enter levels  c colour", curses.A_DIM)
@@ -449,7 +462,7 @@ def draw(win, st):
         if z in st["matches"] and not sel:
             attr = (attr & ~curses.A_DIM) | curses.A_UNDERLINE | curses.A_BOLD
         quiet = attr if sel else (attr & ~curses.A_BOLD) | curses.A_DIM
-        y, x = cell_y(r, top, rh), x0 + (c - 1) * cw
+        y, x = cell_y(r, top, rh,y_gap), x0 + (c - 1) * cw
         fw = max(2, cw - 1)                                 # one-column gap between cells
         if rh == 1:
             lines = [(sym, attr)]
@@ -462,10 +475,12 @@ def draw(win, st):
             put(win, y + i, x, t.center(fw), a)
 
     for (r, c, s) in ((6, 3, "*"), (7, 3, "**"), (9, 2, "*"), (10, 2, "**")):
-        y = cell_y(r, top, rh) + (0 if rh == 1 else 1)
+        y = cell_y(r, top, rh,y_gap) + (0 if rh == 1 else 1)
         put(win, y, x0 + (c - 1) * cw, s.center(cw), curses.A_DIM)
 
-    sy = top + 9 * rh + 1
+    #sy = top + 9 * rh + 1
+    last_y = cell_y(10, top, rh, y_gap) + rh
+    sy = max(top + 9 * rh + 1, last_y + 1)
     put(win, sy, x0, "-" * min(w - 2 - x0, 18 * cw), curses.A_DIM)
     z = st["cur"]
     sym, name, mass, period, group, block = info(z)
