@@ -399,29 +399,27 @@ def init_fills():
 CHAR_ASPECT = 2.0
 
 
+CHAR_ASPECT = 2.0  # typical terminal cell height : width ratio
+
+
 def metrics(h, w):
-    """Scale the grid with equal period gaps and near-square visual cells."""
+    """Scale cells smoothly with terminal size and zoom level."""
     gap_y = 1 if h >= 26 else 0
-    # Total vertical rows needed for 9 grid rows (1..7 + 9..10) + 6 period gaps + 1 lanthanide separator
-    # Leave ~9 rows for top bar + bottom info/status block
-    avail_h = max(9, h - 9 - 6 * gap_y - 1)
-    rh = max(1, min(3, avail_h // 9))
+    # Overhead: header (1) + lanthanide gap (1) + divider (1) + info block (~6) + status (1) = ~10
+    avail_rows = max(9, h - 10 - 6 * gap_y)
+    max_rh_by_h = max(1, min(5, avail_rows // 9))
 
-    # Each cell has `fw` drawn columns + 1 column gap = `cw` total columns.
-    # For a square visual box: fw * char_w ≈ rh * char_h  =>  fw ≈ rh * CHAR_ASPECT
-    target_fw = max(2, round(rh * CHAR_ASPECT))
-    target_cw = target_fw + 1
+    # Each column slot has width `cw` = `fw` (cell text) + `1` (horizontal gap)
+    max_cw_by_w = max(3, (w - 2) // 18)
+    ideal_cw_from_h = max(3, round(max_rh_by_h * CHAR_ASPECT) + 1)
 
-    max_cw = max(3, (w - 2) // 18)
-    cw = min(max_cw, target_cw)
+    cw = max(3, min(max_cw_by_w, ideal_cw_from_h))
+    # Derive row height from chosen cw so aspect stays balanced, while honoring height budget
+    rh_from_w = max(1, min(5, round((cw - 1) / CHAR_ASPECT)))
+    rh = max(1, min(max_rh_by_h, rh_from_w))
 
-    # If the terminal is much wider than it is tall, keep cells near-square instead of stretching wide
-    if cw < target_cw and max_cw >= 3:
-        # Shrink rh if needed so cells stay square-ish rather than tall skinny strips
-        rh_from_w = max(1, min(3, round((cw - 1) / CHAR_ASPECT)))
-        rh = min(rh, rh_from_w)
-
-    x0 = max(1, (w - 18 * cw) // 2)
+    grid_w = 18 * cw - 1
+    x0 = max(1, (w - grid_w) // 2)
     return cw, rh, gap_y, x0
 
 
@@ -640,7 +638,12 @@ def ion_label(sym, stage):
 # ------------------------------------------------------- NIST energy levels
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "periodic")
 LOCAL_DIR = os.environ.get("PERIODIC_LEVELS_DIR", "")
-UNITS = [("cm-1", 1.0), ("eV", 1.0 / 8065.543937), ("Ry", 1.0 / 109737.31568)]
+UNITS = [
+    ("cm-1", 1.0),
+    ("eV", 1.0 / 8065.543937),
+    ("Ry", 1.0 / 109737.31568),
+    ("Eh", 1.0 / 219474.6313632),
+]
 
 
 def levels_url(sym, stage):
@@ -1163,6 +1166,8 @@ def run(win, start):
         return None
 
     while True:
+
+
         draw(win, st)
         ch = win.getch()
         st["msg"] = ""
@@ -1171,7 +1176,8 @@ def run(win, start):
                 curses.update_lines_cols()
             except AttributeError:
                 pass
-            win.clear()
+            win.erase()
+            win.touchwin()
             continue
         if ch == curses.KEY_MOUSE:
             ev = read_mouse()
