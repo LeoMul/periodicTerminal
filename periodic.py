@@ -1,0 +1,1251 @@
+#!/usr/bin/env python3
+"""periodic - a vim-style periodic table for your terminal.
+
+Usage:  periodic [element]        e.g.  periodic Fe   |   periodic 26   |   periodic iron
+Keys:   ? for help.  Enter on an element queries NIST ASD energy levels.
+        :q / :wq / ZZ quit.  The grid scales to the terminal size.
+Mouse:  click selects, double-click / right-click opens levels, wheel scrolls (:set nomouse to turn off)
+Env:    PERIODIC_LEVELS_DIR=dir  look there first for levels_cm_<El>+<charge>.txt files
+        PERIODIC_OPACITY=10..100  cell opacity (default 70)   PERIODIC_NO_MOUSE=1
+"""
+import csv
+import curses
+import io
+import os
+import re
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+os.environ.setdefault("ESCDELAY", "25")
+
+# symbol name mass  (integer mass = most stable isotope, shown as [mass])
+RAW = """H Hydrogen 1.008
+He Helium 4.0026
+Li Lithium 6.94
+Be Beryllium 9.0122
+B Boron 10.81
+C Carbon 12.011
+N Nitrogen 14.007
+O Oxygen 15.999
+F Fluorine 18.998
+Ne Neon 20.180
+Na Sodium 22.990
+Mg Magnesium 24.305
+Al Aluminium 26.982
+Si Silicon 28.085
+P Phosphorus 30.974
+S Sulfur 32.06
+Cl Chlorine 35.45
+Ar Argon 39.948
+K Potassium 39.098
+Ca Calcium 40.078
+Sc Scandium 44.956
+Ti Titanium 47.867
+V Vanadium 50.942
+Cr Chromium 51.996
+Mn Manganese 54.938
+Fe Iron 55.845
+Co Cobalt 58.933
+Ni Nickel 58.693
+Cu Copper 63.546
+Zn Zinc 65.38
+Ga Gallium 69.723
+Ge Germanium 72.630
+As Arsenic 74.922
+Se Selenium 78.971
+Br Bromine 79.904
+Kr Krypton 83.798
+Rb Rubidium 85.468
+Sr Strontium 87.62
+Y Yttrium 88.906
+Zr Zirconium 91.224
+Nb Niobium 92.906
+Mo Molybdenum 95.95
+Tc Technetium 98
+Ru Ruthenium 101.07
+Rh Rhodium 102.91
+Pd Palladium 106.42
+Ag Silver 107.87
+Cd Cadmium 112.41
+In Indium 114.82
+Sn Tin 118.71
+Sb Antimony 121.76
+Te Tellurium 127.60
+I Iodine 126.90
+Xe Xenon 131.29
+Cs Caesium 132.91
+Ba Barium 137.33
+La Lanthanum 138.91
+Ce Cerium 140.12
+Pr Praseodymium 140.91
+Nd Neodymium 144.24
+Pm Promethium 145
+Sm Samarium 150.36
+Eu Europium 151.96
+Gd Gadolinium 157.25
+Tb Terbium 158.93
+Dy Dysprosium 162.50
+Ho Holmium 164.93
+Er Erbium 167.26
+Tm Thulium 168.93
+Yb Ytterbium 173.05
+Lu Lutetium 174.97
+Hf Hafnium 178.49
+Ta Tantalum 180.95
+W Tungsten 183.84
+Re Rhenium 186.21
+Os Osmium 190.23
+Ir Iridium 192.22
+Pt Platinum 195.08
+Au Gold 196.97
+Hg Mercury 200.59
+Tl Thallium 204.38
+Pb Lead 207.2
+Bi Bismuth 208.98
+Po Polonium 209
+At Astatine 210
+Rn Radon 222
+Fr Francium 223
+Ra Radium 226
+Ac Actinium 227
+Th Thorium 232.04
+Pa Protactinium 231.04
+U Uranium 238.03
+Np Neptunium 237
+Pu Plutonium 244
+Am Americium 243
+Cm Curium 247
+Bk Berkelium 247
+Cf Californium 251
+Es Einsteinium 252
+Fm Fermium 257
+Md Mendelevium 258
+No Nobelium 259
+Lr Lawrencium 266
+Rf Rutherfordium 267
+Db Dubnium 268
+Sg Seaborgium 269
+Bh Bohrium 270
+Hs Hassium 277
+Mt Meitnerium 278
+Ds Darmstadtium 281
+Rg Roentgenium 282
+Cn Copernicium 285
+Nh Nihonium 286
+Fl Flerovium 289
+Mc Moscovium 290
+Lv Livermorium 293
+Ts Tennessine 294
+Og Oganesson 294"""
+
+ELEMS = {}  # Z -> (symbol, name, mass)
+for i, line in enumerate(RAW.splitlines(), start=1):
+    s, n, m = line.split()
+    ELEMS[i] = (s, n, m)
+NZ = len(ELEMS)
+
+# ---------------------------------------------------------------- layout
+POS = {}  # Z -> (row, col)
+
+
+def _build():
+    def put(z, r, c):
+        POS[z] = (r, c)
+    put(1, 1, 1); put(2, 1, 18)
+    for z in (3, 4): put(z, 2, z - 2)
+    for z in range(5, 11): put(z, 2, z + 8)
+    for z in (11, 12): put(z, 3, z - 10)
+    for z in range(13, 19): put(z, 3, z)
+    for z in range(19, 37): put(z, 4, z - 18)
+    for z in range(37, 55): put(z, 5, z - 36)
+    for z in (55, 56): put(z, 6, z - 54)
+    for z in range(72, 87): put(z, 6, z - 68)
+    for z in (87, 88): put(z, 7, z - 86)
+    for z in range(104, 119): put(z, 7, z - 100)
+    for z in range(57, 72): put(z, 9, z - 54)    # lanthanides
+    for z in range(89, 104): put(z, 10, z - 86)  # actinides
+
+
+_build()
+GRID = {rc: z for z, rc in POS.items()}
+assert len(POS) == NZ
+
+# ------------------------------------------------------------- categories
+CATS = ["alkali metal", "alkaline earth", "transition metal", "post-transition metal",
+        "metalloid", "nonmetal", "halogen", "noble gas", "lanthanide", "actinide"]
+C256 = [203, 215, 75, 145, 114, 120, 80, 177, 218, 211]
+C8 = [curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_BLUE, curses.COLOR_WHITE,
+      curses.COLOR_GREEN, curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_MAGENTA,
+      curses.COLOR_MAGENTA, curses.COLOR_RED]
+
+
+def category(z):
+    if z in (3, 11, 19, 37, 55, 87): return 0
+    if z in (4, 12, 20, 38, 56, 88): return 1
+    if z in (2, 10, 18, 36, 54, 86, 118): return 7
+    if z in (9, 17, 35, 53, 85, 117): return 6
+    if z in (5, 14, 32, 33, 51, 52): return 4
+    if z in (1, 6, 7, 8, 15, 16, 34): return 5
+    if 57 <= z <= 71: return 8
+    if 89 <= z <= 103: return 9
+    if z in (13, 31, 49, 50, 81, 82, 83, 84, 113, 114, 115, 116): return 3
+    return 2
+
+
+CAT_OF = {z: category(z) for z in ELEMS}
+
+# ------------------------------------------------------ electron configuration
+ORDER = ["1s", "2s", "2p", "3s", "3p", "4s", "3d", "4p", "5s", "4d", "5p",
+         "6s", "4f", "5d", "6p", "7s", "5f", "6d", "7p"]
+CAP = {"s": 2, "p": 6, "d": 10, "f": 14}
+NOBLE = [(86, "[Rn]"), (54, "[Xe]"), (36, "[Kr]"), (18, "[Ar]"), (10, "[Ne]"), (2, "[He]")]
+EXC = {
+    24: "[Ar] 3d5 4s1", 29: "[Ar] 3d10 4s1",
+    41: "[Kr] 4d4 5s1", 42: "[Kr] 4d5 5s1", 44: "[Kr] 4d7 5s1", 45: "[Kr] 4d8 5s1",
+    46: "[Kr] 4d10", 47: "[Kr] 4d10 5s1",
+    57: "[Xe] 5d1 6s2", 58: "[Xe] 4f1 5d1 6s2", 64: "[Xe] 4f7 5d1 6s2",
+    78: "[Xe] 4f14 5d9 6s1", 79: "[Xe] 4f14 5d10 6s1",
+    89: "[Rn] 6d1 7s2", 90: "[Rn] 6d2 7s2", 91: "[Rn] 5f2 6d1 7s2",
+    92: "[Rn] 5f3 6d1 7s2", 93: "[Rn] 5f4 6d1 7s2", 96: "[Rn] 5f7 6d1 7s2",
+    103: "[Rn] 5f14 7s2 7p1",
+}
+
+
+def _fill(z):
+    occ = {}
+    for sub in ORDER:
+        if z <= 0:
+            break
+        n = min(z, CAP[sub[1]])
+        occ[sub] = n
+        z -= n
+    return occ
+
+
+def config(z):
+    if z in EXC:
+        return EXC[z]
+    occ, core = _fill(z), ""
+    for nz, sym in NOBLE:
+        if nz < z:
+            core = sym
+            for s, n in _fill(nz).items():
+                occ[s] -= n
+            break
+    key = lambda kv: (int(kv[0][0]), "spdf".index(kv[0][1]))
+    parts = [f"{s}{n}" for s, n in sorted(occ.items(), key=key) if n > 0]
+    return " ".join(([core] if core else []) + parts)
+
+
+def info(z):
+    r, c = POS[z]
+    period = r if r <= 7 else r - 3
+    if r >= 9: block, group = "f", "-"
+    elif z in (1, 2) or c <= 2: block, group = "s", str(c)
+    elif c >= 13: block, group = "p", str(c)
+    else: block, group = "d", str(c)
+    sym, name, mass = ELEMS[z]
+    mass = mass if "." in mass else f"[{mass}]"
+    return sym, name, mass, period, group, block
+
+
+# -------------------------------------------------------------- navigation
+def move_h(z, d):
+    r, c = POS[z]
+    cols = [cc for (rr, cc) in GRID if rr == r and (cc > c if d > 0 else cc < c)]
+    if not cols:
+        return z
+    return GRID[(r, min(cols) if d > 0 else max(cols))]
+
+
+def move_v(z, d):
+    r, c = POS[z]
+    rows = {rr for (rr, _) in GRID if (rr > r if d > 0 else rr < r)}
+    if not rows:
+        return z
+    nr = min(rows) if d > 0 else max(rows)
+    cols = [cc for (rr, cc) in GRID if rr == nr]
+    return GRID[(nr, min(cols, key=lambda cc: (abs(cc - c), -cc)))]
+
+
+def row_edge(z, last):
+    r, _ = POS[z]
+    cols = [cc for (rr, cc) in GRID if rr == r]
+    return GRID[(r, max(cols) if last else min(cols))]
+
+
+def find(q):
+    q = q.strip().lower()
+    if not q:
+        return []
+    if q.isdigit():
+        return [int(q)] if 1 <= int(q) <= NZ else []
+    exact = [z for z, (s, n, _) in ELEMS.items() if q in (s.lower(), n.lower())]
+    if exact:
+        return exact
+    pre = [z for z, (_, n, _) in ELEMS.items() if n.lower().startswith(q)]
+    sub = [z for z, (_, n, _) in ELEMS.items() if q in n.lower() and z not in pre]
+    return sorted(pre + sub)
+
+
+# ------------------------------------------------------------------ drawing
+def put(win, y, x, s, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w - 1:
+        return
+    s = s[: w - x - 1]
+    if not s:
+        return
+    try:
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def isdig(c):
+    return c != "" and c in "0123456789"
+
+
+MIN_H, MIN_W = 19, 56
+
+# ---- mouse (PRESSED events only; double-click timing is done here, so it works everywhere)
+_B1 = getattr(curses, "BUTTON1_PRESSED", 0)
+_B3 = getattr(curses, "BUTTON3_PRESSED", 0)
+_UP = getattr(curses, "BUTTON4_PRESSED", 0)
+_DN = getattr(curses, "BUTTON5_PRESSED", 0)
+MOUSE_MASK = _B1 | _B3 | _UP | _DN
+
+
+def read_mouse():
+    """Consume one pending mouse event -> ('left'|'right'|'up'|'down', x, y) or None."""
+    try:
+        _, mx, my, _, b = curses.getmouse()
+    except curses.error:
+        return None
+    if _UP and b & _UP: return ("up", mx, my)
+    if _DN and b & _DN: return ("down", mx, my)
+    if _B3 and b & _B3: return ("right", mx, my)
+    if _B1 and b & _B1: return ("left", mx, my)
+    return None
+
+
+class Clicker:
+    """Detects a second click on the same target within 0.5 s."""
+    def __init__(self):
+        self.t, self.key = 0.0, None
+
+    def double(self, key):
+        now = time.monotonic()
+        dbl = key == self.key and now - self.t < 0.5
+        self.t, self.key = now, (None if dbl else key)
+        return dbl
+FILL_BASE = 10  # colour pairs 11..20: white text on a solid category colour
+
+
+# Base colours for the cell fills (cube-aligned so blending stays vivid, not muddy grey)
+FILL_RGB = [(255, 0, 0), (255, 135, 0), (0, 135, 255), (135, 135, 175), (175, 215, 0),
+            (0, 255, 0), (0, 215, 215), (135, 0, 255), (255, 0, 135), (255, 95, 95)]
+
+
+def xterm_rgb(i):
+    if i >= 232:
+        v = 8 + 10 * (i - 232)
+        return (v, v, v)
+    i -= 16
+    lv = (0, 95, 135, 175, 215, 255)
+    return (lv[i // 36], lv[(i // 6) % 6], lv[i % 6])
+
+
+def nearest_xterm(rgb):
+    best, bi = None, 16
+    for i in range(16, 256):
+        r, g, b = xterm_rgb(i)
+        d = (r - rgb[0]) ** 2 + (g - rgb[1]) ** 2 + (b - rgb[2]) ** 2
+        if best is None or d < best:
+            best, bi = d, i
+    return bi
+
+
+def _env_int(name, default):
+    try:
+        return max(10, min(100, int(os.environ.get(name, default))))
+    except ValueError:
+        return default
+
+
+def detect_light():
+    v = os.environ.get("COLORFGBG", "")           # set by some terminals as "fg;bg"
+    return v.split(";")[-1] in ("7", "15") if v else False
+
+
+OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light()}
+
+
+def init_fills():
+    """Cells are drawn as the category colour blended over the terminal background.
+    A terminal cell can't be truly transparent, so opacity is emulated by blending."""
+    a = OPT["opacity"] / 100.0
+    bgc = 255.0 if OPT["light"] else 0.0
+    for i, rgb in enumerate(FILL_RGB):
+        mix = tuple(c * a + bgc * (1 - a) for c in rgb)
+        lum = 0.2126 * mix[0] + 0.7152 * mix[1] + 0.0722 * mix[2]
+        curses.init_pair(FILL_BASE + i + 1, 231 if lum < 150 else 16, nearest_xterm(mix))
+
+
+def metrics(h, w):
+    """Scale the grid to the terminal: cell width, cell height, left margin."""
+    cw_w = max(3, (w - 2) // 18)
+    rh_h = max(1, min(3, (h - 10) // 9))
+    rh = min(rh_h, max(1, (cw_w - 1) // 2))
+    cw = max(3, min(cw_w, 3 * rh + 3))
+    x0 = max(1, (w - 18 * cw) // 2)
+    return cw, rh, x0
+
+
+def cell_y(r, top, rh):
+    if r <= 7:
+        return top + (r - 1) * rh
+    return top + 7 * rh + 1 + (r - 9) * rh
+
+
+def hit_cell(win, mx, my):
+    h, w = win.getmaxyx()
+    if h < MIN_H or w < MIN_W:
+        return None
+    cw, rh, x0 = metrics(h, w)
+    for z, (r, c) in POS.items():
+        y, x = cell_y(r, 1, rh), x0 + (c - 1) * cw
+        if y <= my < y + rh and x <= mx < x + cw:
+            return z
+    return None
+
+
+def draw(win, st):
+    h, w = win.getmaxyx()
+    win.erase()
+    if h < MIN_H or w < MIN_W:
+        put(win, 0, 0, "terminal too small (need %dx%d)" % (MIN_W, MIN_H))
+        win.refresh()
+        return
+    cw, rh, x0 = metrics(h, w)
+    top = 1
+    put(win, 0, x0, "PERIODIC", curses.A_BOLD)
+    put(win, 0, x0 + 10, "? help  :q quit  hjkl w/b  / search  Enter levels  c colour", curses.A_DIM)
+
+    for z, (r, c) in POS.items():
+        sym, _, mass = ELEMS[z]
+        cat = CAT_OF[z]
+        base = curses.color_pair(cat + 1)
+        sel = z == st["cur"]
+        if sel:
+            attr = base | curses.A_REVERSE | curses.A_BOLD
+        elif st["hl"] is not None and cat != st["hl"]:
+            attr = base | curses.A_DIM                      # receded: colour text only
+        else:
+            attr = curses.color_pair(FILL_BASE + cat + 1) | curses.A_BOLD   # solid block
+        if z in st["matches"] and not sel:
+            attr = (attr & ~curses.A_DIM) | curses.A_UNDERLINE | curses.A_BOLD
+        quiet = attr if sel else (attr & ~curses.A_BOLD) | curses.A_DIM
+        y, x = cell_y(r, top, rh), x0 + (c - 1) * cw
+        fw = max(2, cw - 1)                                 # one-column gap between cells
+        if rh == 1:
+            lines = [(sym, attr)]
+        else:
+            lines = [(str(z), quiet), (sym, attr | curses.A_BOLD)]
+            if rh >= 3:
+                ms = ("%.1f" % float(mass)) if "." in mass else "[" + mass + "]"
+                lines.append((ms[:fw], quiet))
+        for i, (t, a) in enumerate(lines):
+            put(win, y + i, x, t.center(fw), a)
+
+    for (r, c, s) in ((6, 3, "*"), (7, 3, "**"), (9, 2, "*"), (10, 2, "**")):
+        y = cell_y(r, top, rh) + (0 if rh == 1 else 1)
+        put(win, y, x0 + (c - 1) * cw, s.center(cw), curses.A_DIM)
+
+    sy = top + 9 * rh + 1
+    put(win, sy, x0, "-" * min(w - 2 - x0, 18 * cw), curses.A_DIM)
+    z = st["cur"]
+    sym, name, mass, period, group, block = info(z)
+    col = curses.color_pair(CAT_OF[z] + 1)
+    put(win, sy + 1, x0, "%s (%s)" % (name, sym), col | curses.A_BOLD)
+    put(win, sy + 2, x0, "Z = %d   mass = %s   period %s   group %s   %s-block" % (z, mass, period, group, block))
+    put(win, sy + 3, x0, "category: ")
+    put(win, sy + 3, x0 + 10, CATS[CAT_OF[z]], col)
+    put(win, sy + 4, x0, "config:   " + config(z))
+    if st["hl"] is not None:
+        put(win, sy + 5, x0, "highlighting: %s  (c/C cycle, Esc clear)" % CATS[st["hl"]], curses.A_DIM)
+    if st["matches"]:
+        put(win, sy + 6, x0, "%d match(es)  n/N next/prev  Esc clear" % len(st["matches"]), curses.A_DIM)
+
+    put(win, h - 1, 1, st["msg"][: w - 14])
+    put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
+    win.refresh()
+
+
+def prompt(win, label):
+    h, w = win.getmaxyx()
+    buf = ""
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    while True:
+        win.move(h - 1, 0)
+        win.clrtoeol()
+        put(win, h - 1, 0, (label + buf)[: w - 2])
+        win.refresh()
+        ch = win.getch()
+        if ch == curses.KEY_MOUSE:
+            read_mouse()
+            continue
+        if ch in (10, 13, curses.KEY_ENTER):
+            break
+        if ch == 27:
+            buf = None
+            break
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            if buf:
+                buf = buf[:-1]
+            else:
+                buf = None
+                break
+        elif 32 <= ch < 127:
+            buf += chr(ch)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    return buf
+
+
+# --------------------------------------------------------------------- help
+HELP = [
+    "h j k l / arrows   move (accepts a count: 5l)",
+    "w / b              next / previous element by atomic number",
+    "0 / $   gg / G     row start / end, hydrogen / oganesson (26G -> Z=26)",
+    "Enter              pick an ionization stage, query energy levels",
+    "/  n  N            search symbol, name or number; next / previous",
+    "c / C              cycle category highlight          Esc  clear",
+    "mouse              click select, double/right-click levels, wheel scroll",
+    ":q :q! :wq :x :qa  quit             ZZ / ZQ   quit",
+    ":26  :Fe  :iron    jump to an element",
+    ":levels [stage]    e.g.  :levels II    :e Fe III",
+    ":set [no]mouse     mouse on / off",
+    ":set opacity=70    cell opacity 10-100   :set background=light|dark",
+    ":noh   :help       clear matches / this help       q  quit",
+]
+
+VHELP = [
+    "j k / arrows       move (accepts a count)",
+    "Ctrl-d / Ctrl-u    half page down / up",
+    "Ctrl-f / Ctrl-b    page down / up",
+    "gg / G             top / bottom   (12G -> row 12)",
+    "/  n  N            search configuration or term, next, previous",
+    "u                  cycle units: cm-1 / eV / Ry",
+    "o                  toggle energy-sorted / NIST order",
+    "r                  refetch from NIST (skip the cache)",
+    "click row / header (header cycles units), wheel scrolls",
+    "q  Esc  :q  ZZ     back",
+    ":qa                quit the program",
+]
+
+
+def show_lines(win, title, lines):
+    win.erase()
+    put(win, 1, 2, title, curses.A_BOLD)
+    for i, line in enumerate(lines):
+        put(win, 3 + i, 2, line)
+    put(win, 4 + len(lines), 2, "press any key", curses.A_DIM)
+    win.refresh()
+    if win.getch() == curses.KEY_MOUSE:
+        read_mouse()
+
+
+QUIT_ALL = {"qa", "qa!", "qall", "qall!", "xa", "wqa", "cq", "cq!"}
+CLOSE = {"q", "q!", "quit", "x", "xit", "exit", "wq", "wq!", "close", "clo"}
+
+# ---------------------------------------------------- ionization stage helpers
+_ROM = ((100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
+        (5, "V"), (4, "IV"), (1, "I"))
+
+
+def roman(n):
+    out = ""
+    for v, s in _ROM:
+        while n >= v:
+            out += s
+            n -= v
+    return out
+
+
+def unroman(s):
+    vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+    s = s.upper()
+    if not s or any(ch not in vals for ch in s):
+        return None
+    tot = 0
+    for i, ch in enumerate(s):
+        v = vals[ch]
+        tot += -v if i + 1 < len(s) and vals[s[i + 1]] > v else v
+    return tot if roman(tot) == s else None
+
+
+def parse_stage(s, z=None):
+    """'II' or '2' -> stage 2 (Fe II = Fe+).  '2+' -> charge 2 -> stage 3."""
+    s = s.strip()
+    if not s:
+        return None
+    if s.endswith("+") and s[:-1].isdigit():
+        v = int(s[:-1]) + 1
+    elif s.isdigit():
+        v = int(s)
+    else:
+        v = unroman(s)
+    if v is None or v < 1 or (z is not None and v > z):
+        return None
+    return v
+
+
+def ion_label(sym, stage):
+    q = stage - 1
+    return sym + ("" if q == 0 else "+" if q == 1 else "%d+" % q)
+
+
+# ------------------------------------------------------- NIST energy levels
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "periodic")
+LOCAL_DIR = os.environ.get("PERIODIC_LEVELS_DIR", "")
+UNITS = [("cm-1", 1.0), ("eV", 1.0 / 8065.543937), ("Ry", 1.0 / 109737.31568)]
+
+
+def levels_url(sym, stage):
+    # NIST takes the ionization *charge* here: "Fe+0" = neutral = Fe I
+    return ("https://physics.nist.gov/cgi-bin/ASD/energy1.pl?de=0&spectrum=%s+%d"
+            "&submit=Retrieve+Data&units=0&format=3&output=0&page_size=15"
+            "&multiplet_ordered=1&conf_out=on&term_out=on&level_out=on&unc_out=1"
+            "&j_out=on&lande_out=on&perc_out=on&biblio=on&temp=" % (sym, stage - 1))
+
+
+def _parse_levels(text):
+    """Parse NIST tab-delimited level output -> [(conf, term, J, E_cm1, flag)]."""
+    rows, cols = [], None
+    prev_conf = prev_term = ""
+    for rec in csv.reader(io.StringIO(text.lstrip("\ufeff")), delimiter="\t", quotechar='"'):
+        rec = [re.sub(r"<[^>]+>", "", x).strip() for x in rec]
+        if cols is None:
+            low = [x.lower() for x in rec]
+            if len(rec) >= 2 and any(x.startswith("level") for x in low):
+                def col(p, low=low):
+                    return next((i for i, x in enumerate(low) if x.startswith(p)), None)
+                cols = {k: col(p) for k, p in (("conf", "configuration"), ("term", "term"),
+                                              ("j", "j"), ("pre", "prefix"), ("lev", "level"))}
+            continue
+        if len(rec) < 2 or cols["lev"] is None:
+            continue
+        get = lambda k: rec[cols[k]] if cols[k] is not None and cols[k] < len(rec) else ""
+        lev = get("lev")
+        m = re.search(r"[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?", lev)
+        if not m:
+            continue
+        pre = get("pre")
+        flag = pre[:1] if pre[:1] in ("[", "(") else (lev[:1] if lev[:1] in ("[", "(") else "")
+        conf, term = get("conf"), get("term")
+        blank_conf = not conf
+        if blank_conf:
+            conf = prev_conf          # grouped output leaves repeats blank
+            if not term:
+                term = prev_term
+        prev_conf, prev_term = conf, term
+        rows.append((conf, term, get("j"), float(m.group()), flag))
+    return rows
+
+
+def _read_rows(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return _parse_levels(f.read())
+    except OSError:
+        return []
+
+
+def _ssl_context():
+    try:
+        import certifi  # fixes CERTIFICATE_VERIFY_FAILED on some macOS pythons
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_levels(sym, stage, force=False):
+    """-> (rows, source, error). Order: local dir, cache, NIST. Cache: ~/.cache/periodic."""
+    cache = os.path.join(CACHE_DIR, "levels_%s_%d.tsv" % (sym, stage))
+    if not force:
+        if LOCAL_DIR:
+            local = os.path.join(os.path.expanduser(LOCAL_DIR), "levels_cm_%s+%d.txt" % (sym, stage - 1))
+            rows = _read_rows(local)
+            if rows:
+                return rows, "local file", None
+        rows = _read_rows(cache)
+        if rows:
+            return rows, "cache", None
+    url = levels_url(sym, stage)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (periodic-tui)"})
+        with urllib.request.urlopen(req, timeout=25, context=_ssl_context()) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001 - show any network problem to the user
+        return [], "none", "network error: %s   url: %s" % (e, url)
+    rows = _parse_levels(text)
+    if not rows:
+        dump = os.path.join(CACHE_DIR, "last_reply.txt")
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(dump, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            dump = "(could not save)"
+        lines = [ln for ln in text.splitlines() if ln.strip()][:4]
+        snip = " // ".join(re.sub(r"<[^>]+>", " ", ln).replace("\t", " | ")[:110] for ln in lines)
+        return [], "none", ("no levels parsed for %s %s (charge %d). reply starts: %s   "
+                            "full reply saved to %s   url: %s" % (sym, roman(stage), stage - 1, snip, dump, url))
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
+    return rows, "NIST ASD", None
+
+
+def fmt_e(e, unit_i, flag):
+    s = ("%.3f" if unit_i == 0 else "%.6f") % (e * UNITS[unit_i][1])
+    return "[" + s + "]" if flag == "[" else "(" + s + ")" if flag == "(" else s
+
+
+# -------------------------------------------------------- list-style layers
+def list_nav(st, ch, c, n, page):
+    """Shared vim motions for list screens. True if the key was consumed."""
+    if st["pend"] == "g":
+        st["pend"] = ""
+        if c == "g":
+            st["cur"] = int(st["count"]) - 1 if st["count"] else 0
+        st["count"] = ""
+        st["cur"] = max(0, min(st["cur"], n - 1))
+        return True
+    if isdig(c) and (c != "0" or st["count"]):
+        st["count"] += c
+        return True
+    cnt = int(st["count"]) if st["count"] else 1
+    had = bool(st["count"])
+    if c == "g":
+        st["pend"] = "g"
+        return True
+    if c == "j" or ch == curses.KEY_DOWN:
+        st["cur"] += cnt
+    elif c == "k" or ch == curses.KEY_UP:
+        st["cur"] -= cnt
+    elif ch == 4:
+        st["cur"] += max(1, page // 2)
+    elif ch == 21:
+        st["cur"] -= max(1, page // 2)
+    elif ch in (6, curses.KEY_NPAGE):
+        st["cur"] += page
+    elif ch in (2, curses.KEY_PPAGE):
+        st["cur"] -= page
+    elif c == "G":
+        st["cur"] = cnt - 1 if had else n - 1
+    else:
+        return False
+    st["count"] = ""
+    st["cur"] = max(0, min(st["cur"], n - 1))
+    return True
+
+
+def stage_picker(win, z):
+    """Choose an ionization stage. -> stage int, None (cancel) or 'quit'."""
+    sym, name, _ = ELEMS[z]
+    st = {"cur": 0, "count": "", "pend": ""}
+    col = curses.color_pair(CAT_OF[z] + 1)
+    top, msg = 0, ""
+    clicker = Clicker()
+    while True:
+        h, w = win.getmaxyx()
+        page = max(1, h - 4)
+        if st["cur"] < top:
+            top = st["cur"]
+        if st["cur"] >= top + page:
+            top = st["cur"] - page + 1
+        win.erase()
+        put(win, 0, 1, "energy levels: %s (%s)" % (name, sym), col | curses.A_BOLD)
+        put(win, 1, 1, "Enter query  j/k move  3<Enter> stage III  q cancel", curses.A_DIM)
+        for i in range(page):
+            k = top + i
+            if k >= z:
+                break
+            stage, ne = k + 1, z - k
+            line = "%-10s %-8s %3d e-   %s-like" % (sym + " " + roman(stage), ion_label(sym, stage), ne, ELEMS[ne][0])
+            on = k == st["cur"]
+            put(win, 2 + i, 1, ("> " if on else "  ") + line, curses.A_REVERSE if on else 0)
+        put(win, h - 2, 1, "[%d/%d]" % (st["cur"] + 1, z), curses.A_DIM)
+        put(win, h - 1, 1, msg)
+        put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
+        win.refresh()
+
+        ch = win.getch()
+        msg = ""
+        if ch == curses.KEY_RESIZE:
+            win.clear()
+            continue
+        if ch == curses.KEY_MOUSE:
+            ev = read_mouse()
+            if ev:
+                kind, mx, my = ev
+                if kind == "up":
+                    st["cur"] = max(0, st["cur"] - 3)
+                elif kind == "down":
+                    st["cur"] = min(z - 1, st["cur"] + 3)
+                else:
+                    k = top + my - 2
+                    if 0 <= my - 2 < page and 0 <= k < z:
+                        st["cur"] = k
+                        if kind == "right" or clicker.double(k):
+                            return k + 1
+            continue
+        c = chr(ch) if 0 <= ch < 256 else ""
+        if st["pend"] == "Z":
+            st["pend"] = ""
+            if c in ("Z", "Q"):
+                return None
+            continue
+        if ch in (10, 13, curses.KEY_ENTER):
+            if st["count"]:
+                v, st["count"] = int(st["count"]), ""
+                if 1 <= v <= z:
+                    return v
+                msg = "no such stage"
+                continue
+            return st["cur"] + 1
+        if ch == 27:
+            if st["count"] or st["pend"]:
+                st["count"] = st["pend"] = ""
+                continue
+            return None
+        if list_nav(st, ch, c, z, page):
+            continue
+        st["count"] = ""
+        if c == "q":
+            return None
+        elif c == "Z":
+            st["pend"] = "Z"
+        elif c == ":":
+            q = prompt(win, ":")
+            if q is None:
+                continue
+            word = q.strip()
+            if word in CLOSE:
+                return None
+            if word in QUIT_ALL:
+                return "quit"
+            v = parse_stage(word, z)
+            if v:
+                return v
+            if word:
+                msg = "E492: Not an editor command: " + word
+
+
+def levels_view(win, sym, stage, rows, source, err):
+    """Scrollable level table. -> 'close', 'quit' or 'refresh'."""
+    st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": ""}
+    view = sorted(rows, key=lambda r: r[3])
+    top = 0
+
+    def hit(r):
+        return bool(st["q"]) and st["q"] in (r[0] + " " + r[1]).lower()
+
+    def jump(d):
+        n, k = len(view), st["cur"]
+        for _ in range(n):
+            k = (k + d) % n
+            if hit(view[k]):
+                st["cur"] = k
+                return True
+        return False
+
+    while True:
+        h, w = win.getmaxyx()
+        page = max(1, h - 4)
+        n = len(view)
+        st["cur"] = max(0, min(st["cur"], n - 1)) if n else 0
+        if st["cur"] < top:
+            top = st["cur"]
+        if st["cur"] >= top + page:
+            top = st["cur"] - page + 1
+        uname = UNITS[st["unit"]][0]
+        confw = max(10, min(60, w - 43))
+
+        win.erase()
+        put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
+        put(win, 1, 1, "%5s %-*s %-12s %-6s %14s" % ("#", confw, "configuration", "term", "J", "E / " + uname),
+            curses.A_DIM | curses.A_UNDERLINE)
+        for i in range(page):
+            k = top + i
+            if k >= n:
+                break
+            conf, term, j, e, flag = view[k]
+            line = "%5d %-*s %-12s %-6s %14s" % (k + 1, confw, conf[:confw], term[:12], j[:6],
+                                               fmt_e(e, st["unit"], flag))
+            attr = curses.A_BOLD if hit(view[k]) else 0
+            if k == st["cur"]:
+                attr = curses.A_REVERSE
+            put(win, 2 + i, 1, line, attr)
+        if n == 0:
+            msg = err or "no data"
+            width = max(10, w - 4)
+            for i in range(0, len(msg), width):
+                put(win, 3 + i // width, 2, msg[i:i + width])
+        put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
+            n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source),
+            curses.A_DIM)
+        put(win, h - 1, 1, st["msg"])
+        put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
+        win.refresh()
+
+        ch = win.getch()
+        st["msg"] = ""
+        if ch == curses.KEY_RESIZE:
+            win.clear()
+            continue
+        if ch == curses.KEY_MOUSE:
+            ev = read_mouse()
+            if ev and n:
+                kind, mx, my = ev
+                if kind == "up":
+                    st["cur"] = max(0, st["cur"] - 3)
+                elif kind == "down":
+                    st["cur"] = min(n - 1, st["cur"] + 3)
+                elif my == 1:
+                    st["unit"] = (st["unit"] + 1) % len(UNITS)
+                elif 0 <= my - 2 < page and top + my - 2 < n:
+                    st["cur"] = top + my - 2
+            continue
+        c = chr(ch) if 0 <= ch < 256 else ""
+        if st["pend"] == "Z":
+            st["pend"] = ""
+            if c in ("Z", "Q"):
+                return "close"
+            continue
+        if ch == 27:
+            if st["count"] or st["pend"] or st["q"]:
+                st["count"] = st["pend"] = st["q"] = ""
+                continue
+            return "close"
+        if list_nav(st, ch, c, n, page):
+            continue
+        st["count"] = ""
+        if c == "q":
+            return "close"
+        elif c == "Z":
+            st["pend"] = "Z"
+        elif c == "?":
+            show_lines(win, "levels - keys", VHELP)
+        elif c == "u":
+            st["unit"] = (st["unit"] + 1) % len(UNITS)
+        elif c == "r":
+            return "refresh"
+        elif c == "o":
+            keep = view[st["cur"]] if view else None
+            st["sort"] = not st["sort"]
+            view = sorted(rows, key=lambda r: r[3]) if st["sort"] else list(rows)
+            if keep in view:
+                st["cur"] = view.index(keep)
+        elif c == "/":
+            q = prompt(win, "/")
+            if q is not None:
+                st["q"] = q.strip().lower()
+                if st["q"] and not jump(1):
+                    st["msg"] = "pattern not found: " + q
+        elif c in ("n", "N") and st["q"]:
+            if not jump(1 if c == "n" else -1):
+                st["msg"] = "pattern not found"
+        elif c == ":":
+            q = prompt(win, ":")
+            if q is None:
+                continue
+            word = q.strip()
+            if word in CLOSE:
+                return "close"
+            if word in QUIT_ALL:
+                return "quit"
+            if word.isdigit():
+                st["cur"] = max(0, min(n - 1, int(word) - 1))
+            elif word:
+                st["msg"] = "E492: Not an editor command: " + word
+
+
+# --------------------------------------------------------------------- main
+def run(win, start):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        big = curses.COLORS >= 256
+        pal = C256 if big else C8
+        for i, fg in enumerate(pal):
+            curses.init_pair(i + 1, fg, -1)
+            if not big:
+                dark_bg = C8[i] in (curses.COLOR_RED, curses.COLOR_BLUE, curses.COLOR_MAGENTA)
+                curses.init_pair(FILL_BASE + i + 1, curses.COLOR_WHITE if dark_bg else curses.COLOR_BLACK, C8[i])
+        if big:
+            init_fills()
+    except curses.error:
+        pass  # monochrome terminal: attributes only
+
+    st = {"cur": 1, "matches": [], "hl": None, "msg": "", "count": "", "pend": ""}
+    clicker = Clicker()
+    if MOUSE_MASK and not os.environ.get("PERIODIC_NO_MOUSE"):
+        curses.mouseinterval(0)
+        curses.mousemask(MOUSE_MASK)
+    if start:
+        hits = find(start)
+        if hits:
+            st["cur"], st["matches"] = hits[0], hits
+
+    def search(q):
+        hits = find(q or "")
+        st["matches"] = hits
+        if not hits:
+            st["msg"] = "no match: %s" % q
+            return
+        after = [z for z in hits if z > st["cur"]]
+        st["cur"] = after[0] if after else hits[0]
+
+    def open_levels(z, stage=None):
+        """Stage picker -> NIST query -> level viewer. Returns 'quit' or None."""
+        sym = ELEMS[z][0]
+        preset, force = stage is not None, False
+        while True:
+            if stage is None:
+                stage = stage_picker(win, z)
+                if stage is None:
+                    return None
+                if stage == "quit":
+                    return "quit"
+            win.erase()
+            put(win, 1, 2, "querying NIST ASD for %s %s ..." % (sym, roman(stage)))
+            win.refresh()
+            rows, src, err = get_levels(sym, stage, force)
+            force = False
+            res = levels_view(win, sym, stage, rows, src, err)
+            if res == "quit":
+                return "quit"
+            if res == "refresh":
+                force = True
+                continue
+            if preset:
+                return None
+            stage = None
+
+    def set_mouse(on):
+        if not on or not MOUSE_MASK:
+            curses.mousemask(0)
+            st["msg"] = "mouse off" if not on else "mouse not supported by this curses"
+            return
+        curses.mouseinterval(0)
+        curses.mousemask(MOUSE_MASK)
+        st["msg"] = "mouse on: click select, double-click opens levels, wheel scrolls"
+
+    def ex_set(opt):
+        opt = opt.strip()
+        if opt in ("mouse", "mouse=a"):
+            set_mouse(True)
+        elif opt in ("nomouse", "mouse="):
+            set_mouse(False)
+        elif opt.startswith("opacity="):
+            try:
+                v = int(opt.split("=", 1)[1])
+            except ValueError:
+                v = 0
+            if not 10 <= v <= 100:
+                st["msg"] = "E474: opacity must be 10-100"
+            elif curses.COLORS < 256:
+                st["msg"] = "opacity needs a 256-colour terminal"
+            else:
+                OPT["opacity"] = v
+                init_fills()
+                st["msg"] = "opacity %d%%" % v
+        elif opt in ("background=light", "background=dark", "bg=light", "bg=dark"):
+            OPT["light"] = opt.endswith("light")
+            if curses.COLORS >= 256:
+                init_fills()
+            st["msg"] = "background=" + ("light" if OPT["light"] else "dark")
+        elif opt in ("opacity", "opacity?"):
+            st["msg"] = "opacity=%d  background=%s" % (OPT["opacity"], "light" if OPT["light"] else "dark")
+        else:
+            st["msg"] = "E518: Unknown option: " + opt
+
+    def ex(cmd):
+        cmd = cmd.strip()
+        if not cmd:
+            return None
+        word, _, arg = cmd.partition(" ")
+        arg = arg.strip()
+        if word in CLOSE or word in QUIT_ALL:
+            return "quit"
+        if word in ("h", "help"):
+            show_lines(win, "PERIODIC - keys", HELP)
+            return None
+        if word in ("noh", "nohlsearch"):
+            st["matches"] = []
+            return None
+        if word in ("w", "write"):
+            st["msg"] = "nothing to write"
+            return None
+        if word in ("set", "se"):
+            ex_set(arg)
+            return None
+        if re.fullmatch(r"[0-9]+", word):
+            v = int(word)
+            if 1 <= v <= NZ:
+                st["cur"] = v
+            else:
+                st["msg"] = "E16: Invalid range"
+            return None
+        if word in ("lev", "levels", "e", "edit"):
+            toks, z, stage = arg.split(), st["cur"], None
+            if len(toks) == 2:
+                hits = find(toks[0])
+                if not hits:
+                    st["msg"] = "no such element: " + toks[0]
+                    return None
+                z = st["cur"] = hits[0]
+            if toks:
+                stage = parse_stage(toks[-1], z)
+                if stage is None and len(toks) == 1 and find(toks[0]):
+                    z = st["cur"] = find(toks[0])[0]
+                elif stage is None:
+                    st["msg"] = "bad ionization stage: " + toks[-1]
+                    return None
+            return open_levels(z, stage)
+        hits = find(cmd)
+        if hits:
+            st["matches"] = hits
+            st["cur"] = hits[0]
+        else:
+            st["msg"] = "E492: Not an editor command: " + cmd
+        return None
+
+    while True:
+        draw(win, st)
+        ch = win.getch()
+        st["msg"] = ""
+        if ch == curses.KEY_RESIZE:
+            try:
+                curses.update_lines_cols()
+            except AttributeError:
+                pass
+            win.clear()
+            continue
+        if ch == curses.KEY_MOUSE:
+            ev = read_mouse()
+            if ev:
+                kind, mx, my = ev
+                if kind in ("up", "down"):
+                    st["cur"] = move_v(st["cur"], -1 if kind == "up" else 1)
+                else:
+                    zc = hit_cell(win, mx, my)
+                    if zc:
+                        st["cur"] = zc
+                        if (kind == "right" or clicker.double(zc)) and open_levels(zc) == "quit":
+                            return
+            continue
+        c = chr(ch) if 0 <= ch < 256 else ""
+
+        if ch == 27:
+            st.update(matches=[], hl=None, count="", pend="")
+            continue
+        if isdig(c) and (c != "0" or st["count"]):
+            st["count"] += c
+            continue
+
+        n = int(st["count"]) if st["count"] else 1
+        had_count = bool(st["count"])
+        st["count"] = ""
+        z = st["cur"]
+
+        if st["pend"] == "g":
+            st["pend"] = ""
+            if c == "g":
+                st["cur"] = n if had_count and 1 <= n <= NZ else 1
+            continue
+        if st["pend"] == "Z":
+            st["pend"] = ""
+            if c in ("Z", "Q"):
+                return
+            continue
+
+        if c == "q":
+            return
+        elif c == "?":
+            show_lines(win, "PERIODIC - keys", HELP)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            if open_levels(z) == "quit":
+                return
+        elif c == "h" or ch == curses.KEY_LEFT:
+            for _ in range(n): z = move_h(z, -1)
+        elif c == "l" or ch == curses.KEY_RIGHT:
+            for _ in range(n): z = move_h(z, +1)
+        elif c == "k" or ch == curses.KEY_UP:
+            for _ in range(n): z = move_v(z, -1)
+        elif c == "j" or ch == curses.KEY_DOWN:
+            for _ in range(n): z = move_v(z, +1)
+        elif c == "w":
+            z = min(NZ, z + n)
+        elif c == "b":
+            z = max(1, z - n)
+        elif c in ("0", "^"):
+            z = row_edge(z, False)
+        elif c == "$":
+            z = row_edge(z, True)
+        elif c == "g":
+            st["pend"] = "g"
+        elif c == "Z":
+            st["pend"] = "Z"
+        elif c == "G":
+            z = n if had_count and 1 <= n <= NZ else NZ
+        elif c == "/":
+            q = prompt(win, "/")
+            if q is not None:
+                search(q)
+                z = st["cur"]
+        elif c == ":":
+            q = prompt(win, ":")
+            if q is not None and ex(q) == "quit":
+                return
+            z = st["cur"]
+        elif c in ("n", "N") and st["matches"]:
+            ms = sorted(st["matches"])
+            i = ms.index(z) if z in ms else -1
+            i = (i + (1 if c == "n" else -1)) % len(ms)
+            z = ms[i]
+        elif c == "c":
+            st["hl"] = 0 if st["hl"] is None else (st["hl"] + 1) % len(CATS)
+        elif c == "C":
+            st["hl"] = len(CATS) - 1 if st["hl"] is None else (st["hl"] - 1) % len(CATS)
+        st["cur"] = z
+
+
+def main():
+    start = " ".join(sys.argv[1:]) or None
+    try:
+        curses.wrapper(run, start)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
