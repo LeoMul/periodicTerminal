@@ -11,9 +11,11 @@ Env:    PERIODIC_LEVELS_DIR=dir  look there first for levels_cm_<El>+<charge>.tx
         PERIODIC_SPACING=0        no gaps between cells
         PERIODIC_CACHE_MB=500     cap on ~/.cache/periodic (oldest files removed first)
         PERIODIC_LITE=1           start in lite mode (L toggles)
+        PERIODIC_LINES_DIR=dir    look there first for NIST lines files lines_<El>+<charge>.txt
 """
 import csv
 import curses
+import functools
 import io
 import math
 import os
@@ -394,7 +396,7 @@ OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light(),
        "aspect": _env_float("PERIODIC_ASPECT", 2.0, 1.0, 3.0),
        "space": os.environ.get("PERIODIC_SPACING", "1") not in ("0", "off", "no"),
        "lite": os.environ.get("PERIODIC_LITE", "0") not in ("0", "", "off", "no"),
-       "cut": {"M1": 0, "E1": 3}, "m1air": False}
+       "cut": {"M1": 0, "E1": 3, "NIST": 0}, "m1air": False}
 
 
 def input_pending(win):
@@ -629,14 +631,20 @@ VHELP = [
     "u                  cycle units: cm-1 / eV / Ry / Eh",
     "c                  colour on / off: configuration by outer subshell (s p d f),",
     "                   term by parity (even / odd*), energy red (low) -> blue (high)",
-    "f                  cycle line tags: M1 (in-term dJ=1, empirical A) -> E1 allowed -> off",
-    "                   E1: one-electron LS-allowed lines, hydrogenic f (dn0 / Kramers, capped)",
-    "                   method tag: dn0 same-shell, kram Kramers, cap / f=1 capped, ? penetrating",
+    "f                  cycle line tags: M1 (in-term dJ=1, empirical A) -> E1 allowed ->",
+    "                   NIST (all lines with A in NIST ASD) -> off.  Only the NIST state",
+    "                   queries NIST; M1/E1 use NIST values already on disk.  Tags show",
+    "                   NIST's A and grade (N:B+) where known, with our estimate after it",
+    "                   E1: one-electron LS-allowed lines, hydrogenic f estimates",
+    "                   method tag: dn0 same-shell, hyd exact hydrogenic, mix blend of the two,",
+    "                   f=1 capped, ? penetrating d/f orbital; strength split by LS 6j,",
+    "                   ~ = no stated parent, so lower terms share by (2L+1)(2S+1)",
     "                   ci: ns np^(k+1) -> ns2 np^k type, often much weaker (configuration mixing)",
-    "F                  full list for the current mode, strongest first (Enter -> upper level)",
+    "F                  full list for the current mode: A_NIST, grade, A_est, est/NIST side by side",
+    "                   s cycles sort: A / wavelength / worst est-vs-NIST agreement first",
     "t / a              cycle minimum A shown / air vs vacuum wavelengths",
     "o                  toggle energy-sorted / NIST order",
-    "r                  refetch from NIST (skip the cache)",
+    "r                  refetch levels and lines from NIST (skip the cache)",
     "click row / header (header cycles units), wheel scrolls",
     "q  Esc  :q  ZZ     back",
     ":qa                quit the program",
@@ -1016,12 +1024,19 @@ def lam_attr(lam):
 
 
 def method_attr(tag):
-    """dn0/kram: hydrogenic formula used; cap/f=1: limited; '?': penetrating orbital."""
+    """dn0/hyd/mix: hydrogenic estimate used; f=1: capped; ci or ?: treat with care."""
     if "?" in tag or "ci" in tag:
         return curses.color_pair(LV_BASE + 1)                  # red-ish: treat with care
-    if tag.startswith(("dn0", "kram")):
+    if tag.startswith(("dn0", "hyd", "mix")):
         return curses.color_pair(LV_BASE + 2)                  # green
     return curses.color_pair(LV_LIMIT)                         # yellow: capped / f = 1
+
+
+def line_kind(info, mode):
+    """Which strength scale to colour an A by: E1 thresholds for allowed lines, M1 otherwise."""
+    if mode == "NIST":
+        return "E1" if nist_kind(info.get("type", "")) == "E1" else "M1"
+    return mode
 
 
 def a_attr(A, mode="M1"):
@@ -1038,13 +1053,19 @@ def a_attr(A, mode="M1"):
 #   (dS = 0, |dL| <= 1, no S-S), and one electron jumps n_a l_a <- n_b l_b with |dl| = 1.
 #   One-electron absorption f for a -> b, with n* = zeta sqrt(Ry/(E_limit - E)), zeta = stage:
 #     dn = 0 : f0 = (dE/Ry)/3 * l_>/(2l_a+1) * sigma^2,  sigma = 3/2 (n*/zeta) sqrt(n*^2 - l_>^2)
-#     dn != 0: fK = 0.8 * 32/(3 pi sqrt3) / (n_lo^5 n_hi^3) / (1/n_lo^2 - 1/n_hi^2)^3   (Kramers,
-#              integer n from the configuration), used as f = min(fK, f0, 1)
-#     no ionization limit in the list: f = min(fK, 1) for dn != 0, f = 1 for dn = 0
-#   Then for each upper level, the array's decay is shared over the allowed lower levels of
-#   that lower configuration in proportion to (2J_l+1), and scaled by occupancy:
+#     dn != 0: f_H = exact hydrogenic f(n_a l_a -> n_b l_b) with the integer n of the configuration,
+#              blended with the same-shell formula by how much of the integer dn survives in n*:
+#              f = f0^(1-x) f_H^x,  x = (n*_b - n*_a)/(n_b - n_a) clipped to [0, 1]
+#              (large quantum defects shrink dn*, and the line behaves more like dn = 0)
+#     no ionization limit in the list: f = f_H for dn != 0, f = 1 for dn = 0
+#   Then for each upper level, the array's decay is shared over the lower levels of that lower
+#   configuration with LS 6j fractions and scaled by occupancy:
 #     A_line = 6.670e15 (2l_a+1)/(2l_b+1) f / lambda[A]^2 * N_b * vac_a/(2(2l_a+1)) * w_line
-#   Method tags: dn0, kram (Kramers), cap (f0 smaller than Kramers), f=1; '?' marks a d/f
+#     w_line = F_term * F_J,  F_J = (2J_l+1){L_u J_u S; J_l L_l 1}^2 (normalised),
+#              F_term = (2L_l+1){l_b L_u L_c; L_l l_a 1}^2 (normalised) for a stated parent L_c
+#              or closed core, else (2L_l+1)(2S+1) shared over the lower terms present ('~').
+#     Non-LS terms fall back to (2J_l+1) sharing.
+#   Method tags: dn0, hyd (hydrogenic, x > 0.9), mix (blend), f=1 (capped); '?' marks a d/f
 #   orbital with n*^2 <= l(l+1), where the hydrogenic picture is poor; 'ci' marks an
 #   inner-subshell jump (ns np^(k+1) -> ns2 np^k), where configuration mixing often cancels
 #   much of the strength.
@@ -1081,7 +1102,35 @@ def one_jump(o1, o2):
     return (in2, in1) if abs(in1[1] - in2[1]) == 1 else None
 
 
-_KRAMERS = 0.8 * 32.0 / (3 * math.pi * math.sqrt(3))
+def _h_poly(n, l):
+    """R_nl(r) = N r^l e^{-r/n} sum_i c_i r^i  for hydrogen (Z = 1), exact rationals."""
+    from fractions import Fraction as Fr
+    k, a = n - l - 1, 2 * l + 1
+    return [Fr((-1) ** i * math.comb(k + a, k - i), math.factorial(i)) * Fr(2, n) ** i for i in range(k + 1)]
+
+
+@functools.lru_cache(maxsize=None)
+def sigma_H(n1, l1, n2, l2):
+    """Hydrogenic radial dipole integral <n1 l1 | r | n2 l2> in a0 (exact, Z = 1)."""
+    from fractions import Fraction as Fr
+    if not (0 <= l1 < n1 and 0 <= l2 < n2):
+        return 0.0
+
+    def n2c(n, l):
+        return Fr(2, n) ** 3 * math.factorial(n - l - 1) / (2 * n * math.factorial(n + l)) * Fr(2, n) ** (2 * l)
+    beta, tot = Fr(1, n1) + Fr(1, n2), Fr(0)
+    for i, c1 in enumerate(_h_poly(n1, l1)):
+        for j, c2 in enumerate(_h_poly(n2, l2)):
+            p = l1 + l2 + i + j + 3
+            tot += c1 * c2 * math.factorial(p) / beta ** (p + 1)
+    return abs(float(tot) * math.sqrt(float(n2c(n1, l1) * n2c(n2, l2))))
+
+
+def f_H(na, la, nb, lb):
+    """Hydrogenic absorption oscillator strength na la -> nb lb (Z-independent)."""
+    if na == nb:
+        return 0.0
+    return abs(1.0 / na ** 2 - 1.0 / nb ** 2) / 3.0 * max(la, lb) / (2 * la + 1) * sigma_H(na, la, nb, lb) ** 2
 
 
 def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
@@ -1093,12 +1142,9 @@ def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
     ns2 np^(k-1) nd, which can cancel much of the strength."""
     (na, la), (nb, lb) = ka, kb
     lg = max(la, lb)
-    fK = None
-    if na != nb:
-        n_lo, n_hi = min(na, nb), max(na, nb)
-        fK = _KRAMERS / (n_lo ** 5 * n_hi ** 3) / (1.0 / n_lo ** 2 - 1.0 / n_hi ** 2) ** 3
+    fH = f_H(na, la, nb, lb) if na != nb else None
     if elim is None or E_up >= elim:
-        return (min(fK, 1.0), "kram" if fK < 1 else "f=1") if fK is not None else (1.0, "f=1")
+        return (min(fH, 1.0), "hyd") if fH else (1.0, "f=1")
     if inner:
         nsa = zeta * math.sqrt(RY_CM / (elim - E_lo + (E_up - E_lo)))
         nsb = zeta * math.sqrt(RY_CM / (elim - E_lo))
@@ -1110,10 +1156,85 @@ def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
     f0 = (E_up - E_lo) / RY_CM / 3.0 * lg / (2 * la + 1) * sig * sig
     pen = any(l >= 2 and ns * ns <= l * (l + 1) for l, ns in ((la, nsa), (lb, nsb)))
     q = (" ci" if inner else "") + ("?" if pen else "")
-    if fK is None:
+    if fH is None:
         return (min(f0, 1.0), ("dn0" if f0 < 1 else "f=1") + q)
-    f = min(fK, f0, 1.0)
-    return f, ("kram" if f == fK else "cap" if f == f0 else "f=1") + q
+    if fH <= 0:
+        return (0.0, "hyd" + q)
+    x = max(0.0, min(1.0, abs(nsb - nsa) / abs(nb - na)))
+    f = math.exp((1 - x) * math.log(max(f0, 1e-30)) + x * math.log(fH))
+    if f >= 1.0:
+        return 1.0, "f=1" + q
+    return f, ("hyd" if x > 0.9 else "mix") + q
+
+
+@functools.lru_cache(maxsize=None)
+def wigner6j(a, b, c, d, e, f):
+    """{a b c; d e f} by Racah's formula; arguments may be half-integers."""
+    a2, b2, c2, d2, e2, f2 = (int(round(2 * x)) for x in (a, b, c, d, e, f))
+
+    def tri(x, y, z):
+        return (x + y + z) % 2 == 0 and abs(x - y) <= z <= x + y
+    if not (tri(a2, b2, c2) and tri(a2, e2, f2) and tri(d2, b2, f2) and tri(d2, e2, c2)):
+        return 0.0
+    F = math.factorial
+
+    def dl(x, y, z):
+        return math.sqrt(F((x + y - z) // 2) * F((x - y + z) // 2) * F((-x + y + z) // 2)
+                         / F((x + y + z) // 2 + 1))
+    t1, t2, t3, t4 = (a2 + b2 + c2) // 2, (a2 + e2 + f2) // 2, (d2 + b2 + f2) // 2, (d2 + e2 + c2) // 2
+    u1, u2, u3 = (a2 + b2 + d2 + e2) // 2, (a2 + c2 + d2 + f2) // 2, (b2 + c2 + e2 + f2) // 2
+    tot = 0.0
+    for t in range(max(t1, t2, t3, t4), min(u1, u2, u3) + 1):
+        tot += (-1) ** t * F(t + 1) / (F(t - t1) * F(t - t2) * F(t - t3) * F(t - t4)
+                                       * F(u1 - t) * F(u2 - t) * F(u3 - t))
+    return dl(a2, b2, c2) * dl(a2, e2, f2) * dl(d2, b2, f2) * dl(d2, e2, c2) * tot
+
+
+def _span(lo, hi):
+    out, v = [], lo
+    while v <= hi + 1e-9:
+        out.append(v)
+        v += 1.0
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def frac_J(Lu, Ju, S, Ll, Jl):
+    """LS fine-structure branching of upper level J_u into lower J_l (sums to 1 over J_l)."""
+    def wt(J):
+        return (2 * J + 1) * wigner6j(Lu, Ju, S, J, Ll, 1) ** 2
+    tot = sum(wt(J) for J in _span(abs(Ll - S), Ll + S))
+    return wt(Jl) / tot if tot > 0 else 0.0
+
+
+@functools.lru_cache(maxsize=None)
+def frac_L(Lu, lb, Lc, la, Ll):
+    """Branching of upper term L_u (parent L_c + l_b) into lower term L_l (parent L_c + l_a),
+    summing to 1 over all L_l allowed by the parent."""
+    def wt(L):
+        return (2 * L + 1) * wigner6j(lb, Lu, Lc, L, la, 1) ** 2
+    tot = sum(wt(L) for L in _span(abs(Lc - la), Lc + la))
+    return wt(Ll) / tot if tot > 0 else 0.0
+
+
+_PARENT = re.compile(r"^(.*)\.\(\s*(\d+)([SPDFGHIKLMNOQ])[*°]?\s*\)\.(\d+)([spdfghik])1?$")
+
+
+def _open_shells(occ):
+    return frozenset((k, q) for k, q in occ.items() if q != 2 * (2 * k[1] + 1))
+
+
+@functools.lru_cache(maxsize=None)
+def parent_info(conf, orb):
+    """(open shells of the core, parent label, L_c) when `orb` is one electron coupled to a
+    stated parent term, or to a closed core; None otherwise.  Cached per configuration."""
+    occ = conf_occ(conf)
+    m = _PARENT.match(conf.strip())
+    if m and (int(m.group(4)), _LL.index(m.group(5))) == orb:
+        return (_open_shells(conf_occ(m.group(1))), m.group(2) + m.group(3), _LETTERS.index(m.group(3)))
+    if occ.get(orb) == 1 and all(q == 2 * (2 * k[1] + 1) for k, q in occ.items() if k != orb):
+        return (frozenset(), "1S", 0)
+    return None
 
 
 def e1_A(lam_A, Ju, Jl, f=1.0):
@@ -1136,7 +1257,8 @@ def e1_lines(rows, stage=1):
             continue
         key = (conf.strip(), term.strip())
         if key not in terms:
-            terms[key] = {"LS": term_LS(term), "odd": is_odd(term), "occ": conf_occ(conf), "levels": []}
+            terms[key] = {"LS": term_LS(term), "odd": is_odd(term), "occ": conf_occ(conf), "levels": [],
+                          "key": key}
         terms[key]["levels"].append((r, J))
     keys, jump_cache, cand = list(terms), {}, []
     for i in range(len(keys)):
@@ -1166,23 +1288,57 @@ def e1_lines(rows, stage=1):
                         cand.append((r1, J1, t1, r2, J2, keys[k][0], extra_in_2, extra_in_1, note, t2))
                     else:
                         cand.append((r2, J2, t2, r1, J1, keys[i][0], extra_in_1, extra_in_2, note, t1))
-    # (2J_l+1) sharing: per upper level and lower configuration
-    wsum = {}
-    for up, Ju, tu, lo, Jl, lconf, ka, kb, note, tl in cand:
-        key = (id(up), lconf)
-        wsum[key] = wsum.get(key, 0.0) + 2 * Jl + 1
+    # Branching of each upper level over the lower levels of each lower configuration:
+    #   both terms LS: (term fraction) x (J fraction).  The term fraction is the parent 6j when both
+    #   configurations show the same parent (or closed core); otherwise the lower terms present
+    #   share by (2L_l+1)(2S+1) and the line is tagged '~'.  The J fraction is always the LS 6j.
+    #   any non-LS term in the group: (2J_l+1) sharing, as a fallback.
+    groups = {}
+    for c in cand:
+        groups.setdefault((id(c[0]), c[5]), []).append(c)
+    weight = {}
+    for grp in groups.values():
+        if not all(c[2]["LS"] and c[9]["LS"] for c in grp):
+            tot = sum(2 * c[4] + 1 for c in grp)
+            for c in grp:
+                weight[id(c)] = ((2 * c[4] + 1) / tot, "")
+            continue
+        tu, ka, kb = grp[0][2], grp[0][6], grp[0][7]
+        Lu, S = tu["LS"]
+        lterms = {}
+        for c in grp:
+            lterms[c[9]["key"]] = c[9]
+        pu = parent_info(tu["key"][0], kb)
+        tw, mark = {}, ""
+        for lk, tl in lterms.items():
+            pl = parent_info(lk[0], ka)
+            if not (pu and pl and pu[:2] == pl[:2]):
+                tw = None
+                break
+            tw[lk] = frac_L(Lu, kb[1], pu[2], ka[1], tl["LS"][0])
+        if tw is None:
+            raw = {lk: (2 * tl["LS"][0] + 1) * (2 * tl["LS"][1] + 1) for lk, tl in lterms.items()}
+            tot = sum(raw.values())
+            tw = {lk: v / tot for lk, v in raw.items()}
+            mark = "~" if len(lterms) > 1 else ""
+        for c in grp:
+            Ll = c[9]["LS"][0]
+            weight[id(c)] = (tw[c[9]["key"]] * frac_J(Lu, c[1], S, Ll, c[4]), mark)
     out = []
-    for up, Ju, tu, lo, Jl, lconf, ka, kb, note, tl in cand:
+    for c in cand:
+        up, Ju, tu, lo, Jl, lconf, ka, kb, note, tl = c
+        w, mark = weight[id(c)]
+        if w <= 0:
+            continue
         inner = tl["occ"].get(kb, 0) > 0
         f, tag = f_hydrogenic(ka, kb, lo[3], up[3], elim, zeta, inner)
         cap_a = 2 * (2 * ka[1] + 1)
         occ = tu["occ"].get(kb, 1) * max(0, cap_a - tu["occ"].get(ka, 0)) / cap_a
         if occ <= 0 or f <= 0:
             continue
-        w = (2 * Jl + 1) / wsum[(id(up), lconf)]
         lam = 1.0e8 / (up[3] - lo[3])
         A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * w
-        out.append((A, lam, up, lo, Ju, Jl, tag + note))
+        out.append((A, lam, up, lo, Ju, Jl, tag + mark + note))
     out.sort(key=lambda t: -t[0])
     return out
 
@@ -1193,10 +1349,227 @@ MODES = {
            "formula": "A = 1.3 s⁻¹ (λ/4 µm)⁻³ f(J,L,S)   empirical, pure-LS estimate"},
     "E1": {"cuts": [0.0, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9], "strong": 1e8, "moderate": 1e6,
            "title": "LS-allowed E1 lines (one-electron jumps)",
-           "formula": "hydrogenic f (dn0: same-shell formula, kram: Kramers, capped), "
-                      "shared by (2J_l+1), x occupancy; ? = penetrating d/f orbital"},
+           "formula": "hydrogenic f (dn0 same-shell, hyd exact hydrogenic, mix blend by dn*/dn), "
+                      "split by LS 6j, x occupancy"},
 }
+MODES["NIST"] = {"cuts": [0.0, 1e-2, 1.0, 1e2, 1e4, 1e6, 1e8], "strong": 1e8, "moderate": 1e6,
+                 "title": "NIST ASD lines with transition probabilities",
+                 "formula": "A_NIST from NIST ASD (accuracy grade); A_est is ours where the line is in our M1/E1 sets"}
 A_CUTS = MODES["M1"]["cuts"]
+
+
+# ---- NIST ASD lines with transition probabilities
+LINES_DIR = os.environ.get("PERIODIC_LINES_DIR", "")
+
+
+def lines_url(sym, stage):
+    """Tab-delimited NIST ASD lines, only those with transition probabilities (line_out=1),
+    allowed and forbidden, with configurations, terms, J and energies.  Charge notation: Fe+1."""
+    return ("https://physics.nist.gov/cgi-bin/ASD/lines1.pl?spectra=%s+%d&output_type=0&low_w=&upp_w="
+            "&unit=1&submit=Retrieve+Data&de=0&plot_out=0&I_scale_type=1&format=3&line_out=1"
+            "&remove_js=on&en_unit=0&output=0&bibrefs=1&page_size=15&show_obs_wl=1&show_calc_wl=1"
+            "&unc_out=1&order_out=0&max_low_enrg=&show_av=2&max_upp_enrg=&tsb_value=0&min_str=&A_out=0"
+            "&intens_out=on&max_str=&allowed_out=1&forbid_out=1&min_accur=&min_intens=&conf_out=on"
+            "&term_out=on&enrg_out=on&J_out=on" % (sym, stage - 1))
+
+
+_NUM = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+
+
+def _num(x):
+    """'"1872.5998"' / '[123.4]' / '2.8e+07' -> float; None if blank or relative (+x)."""
+    x = x.strip().strip('="')
+    if not x or re.search(r"\+\s*[a-z]", x):
+        return None
+    m = _NUM.search(x)
+    return float(m.group()) if m else None
+
+
+def _parse_lines(text):
+    """-> (records, header_found).  Columns are found by name, so a reordering by NIST or a
+    leading index column (pandas-written backups) doesn't matter."""
+    recs, cols = [], None
+    for rec in csv.reader(io.StringIO(text.lstrip("﻿")), delimiter="\t", quotechar='"'):
+        rec = [x.strip().strip('="').strip() for x in rec]
+        if cols is None:
+            low = [x.lower() for x in rec]
+            if any(x.startswith("aki") for x in low) and any(x.startswith("ek") for x in low):
+                def col(prefix, low=low):
+                    return next((i for i, x in enumerate(low) if x.startswith(prefix)), None)
+                cols = {k: col(p) for k, p in (("A", "aki"), ("acc", "acc"), ("Ei", "ei("), ("Ek", "ek("),
+                                               ("ci", "conf_i"), ("ti", "term_i"), ("Ji", "j_i"),
+                                               ("ck", "conf_k"), ("tk", "term_k"), ("Jk", "j_k"),
+                                               ("type", "type"), ("ritz", "ritz_wl"), ("obs", "obs_wl"))}
+            continue
+
+        def get(k, rec=rec):
+            i = cols.get(k)
+            return rec[i] if i is not None and i < len(rec) else ""
+        A = _num(get("A"))
+        if not A or A <= 0:
+            continue
+        wl = _num(get("ritz")) or _num(get("obs"))
+        recs.append({"A": A, "acc": get("acc"), "Ei": _num(get("Ei")), "Ek": _num(get("Ek")),
+                     "ci": get("ci"), "ti": get("ti"), "Ji": parse_J(get("Ji")),
+                     "ck": get("ck"), "tk": get("tk"), "Jk": parse_J(get("Jk")),
+                     "type": get("type").strip() or "E1", "wl_nm": wl})
+    return recs, cols is not None
+
+
+def get_nist_lines(sym, stage, force=False, allow_net=True):
+    """-> (records, source, error).  Order: PERIODIC_LINES_DIR, cache, NIST (only if allow_net;
+    otherwise ([], '', None) when nothing is on disk)."""
+    cache = os.path.join(CACHE_DIR, "lines_%s_%d.tsv" % (sym, stage))
+    if not force:
+        if LINES_DIR:
+            path = os.path.join(os.path.expanduser(LINES_DIR), "lines_%s+%d.txt" % (sym, stage - 1))
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    recs, ok = _parse_lines(f.read())
+                if ok:
+                    return recs, "local file", None
+            except OSError:
+                pass
+        try:
+            with open(cache, encoding="utf-8", errors="replace") as f:
+                recs, ok = _parse_lines(f.read())
+            if ok:
+                try:
+                    os.utime(cache)
+                except OSError:
+                    pass
+                return recs, "cache", None
+        except OSError:
+            pass
+    if not allow_net:
+        return [], "", None
+    url = lines_url(sym, stage)
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (periodic-tui)"})
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return [], "none", "network error: %s" % e
+    recs, ok = _parse_lines(text)
+    if not ok:
+        snip = " ".join(re.sub(r"<[^>]+>", " ", text).split())[:120]
+        return [], "none", "no lines table in NIST reply: %s" % snip
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(text)
+        prune_cache(keep=cache)
+    except OSError:
+        pass
+    return recs, "NIST ASD", None
+
+
+def match_nist(recs, rows):
+    """Attach each NIST line to our level rows by energy and J (energies agree to ~0.05 cm-1;
+    configuration and term strings are not relied on).  Unmatched ends get a stand-in row
+    built from the line's own data.  -> list of dicts with up/lo rows, Ju/Jl, lam (A, vac)."""
+    import bisect
+    byJ = {}
+    for r in rows:
+        if is_limit(r[0], r[1]):
+            continue
+        J = parse_J(r[2])
+        if J is not None:
+            byJ.setdefault(J, []).append((r[3], r))
+    for v in byJ.values():
+        v.sort(key=lambda t: t[0])
+    keys = {J: [e for e, _ in v] for J, v in byJ.items()}
+
+    def find(E, J):
+        if E is None or J is None or J not in byJ:
+            return None
+        es, i = keys[J], bisect.bisect_left(keys[J], E)
+        best = None
+        for k in (i - 1, i):
+            if 0 <= k < len(es) and abs(es[k] - E) <= 0.05 + 1e-6 * abs(E):
+                if best is None or abs(es[k] - E) < abs(es[best] - E):
+                    best = k
+        return byJ[J][best][1] if best is not None else None
+
+    out = []
+    for rec in recs:
+        up, lo = find(rec["Ek"], rec["Jk"]), find(rec["Ei"], rec["Ji"])
+        if up is None:
+            up = (rec["ck"], rec["tk"], fmt_J(rec["Jk"]) if rec["Jk"] is not None else "", rec["Ek"] or 0.0, "")
+        if lo is None:
+            lo = (rec["ci"], rec["ti"], fmt_J(rec["Ji"]) if rec["Ji"] is not None else "", rec["Ei"] or 0.0, "")
+        if up[3] and lo[3] is not None and up[3] > lo[3]:
+            lam = 1.0e8 / (up[3] - lo[3])
+        elif rec["wl_nm"]:
+            lam = rec["wl_nm"] * 10.0
+        else:
+            continue
+        out.append({"A": rec["A"], "acc": rec["acc"], "type": rec["type"], "up": up, "lo": lo,
+                    "Ju": rec["Jk"], "Jl": rec["Ji"], "lam": lam})
+    return out
+
+
+def nist_status(nst):
+    """One-line summary of the NIST lines state for status bars."""
+    if nst["have"]:
+        return "NIST: %d lines (%s)" % (len(nst["recs"] or []), nst["src"])
+    if nst["net_tried"] and nst["err"]:
+        return "NIST lines unavailable: " + nst["err"]
+    return "NIST: not queried (f to the NIST state fetches it)"
+
+
+def nist_kind(typ):
+    """NIST 'Type' -> which estimate mode it belongs to: 'E1', 'M1' or None (E2, M2, ...)."""
+    t = typ.upper()
+    if t in ("", "E1"):
+        return "E1"
+    if t.startswith("M1"):
+        return "M1"
+    return None
+
+
+def merge_lines(est, nist, mode):
+    """Estimated lines (7-tuples) + matched NIST lines -> 8-tuples
+    (A_best, lam, up, lo, Ju, Jl, tag, info) with info = {est, nist, acc, type}.
+    A_best is NIST's A when known, otherwise the estimate.  In mode 'NIST' every NIST line
+    is listed, with the matching estimate attached when there is one."""
+    nmap = {}
+    for d in nist:
+        key = (id(d["up"]), id(d["lo"]))
+        if key not in nmap or _acc_rank(d["acc"]) < _acc_rank(nmap[key]["acc"]):
+            nmap[key] = d
+    out, used = [], set()
+    if mode == "NIST":
+        emap = {(id(t[2]), id(t[3])): t for t in est}
+        for key, d in nmap.items():
+            e = emap.get(key)
+            info = {"est": e[0] if e else None, "nist": d["A"], "acc": d["acc"], "type": d["type"]}
+            out.append((d["A"], d["lam"], d["up"], d["lo"], d["Ju"], d["Jl"], d["type"], info))
+    else:
+        for t in est:
+            key = (id(t[2]), id(t[3]))
+            d = nmap.get(key)
+            if d is not None and nist_kind(d["type"]) != mode:
+                d = None
+            if d is not None:
+                used.add(key)
+            info = {"est": t[0], "nist": d["A"] if d else None, "acc": d["acc"] if d else "",
+                    "type": d["type"] if d else mode}
+            out.append(((d["A"] if d else t[0]),) + tuple(t[1:7]) + (info,))
+        for key, d in nmap.items():
+            if key not in used and nist_kind(d["type"]) == mode:
+                info = {"est": None, "nist": d["A"], "acc": d["acc"], "type": d["type"]}
+                out.append((d["A"], d["lam"], d["up"], d["lo"], d["Ju"], d["Jl"], None, info))
+    out.sort(key=lambda t: -t[0])
+    return out
+
+
+_ACC = ["AAA", "AA", "A+", "A", "B+", "B", "C+", "C", "D+", "D", "E"]
+
+
+def _acc_rank(a):
+    return _ACC.index(a) if a in _ACC else len(_ACC)
 
 
 def fmt_e(e, unit_i, flag):
@@ -1335,23 +1708,49 @@ def stage_picker(win, z):
                 msg = "E492: Not an editor command: " + word
 
 
-def levels_view(win, sym, stage, rows, source, err):
+def levels_view(win, sym, stage, rows, source, err, force_lines=False):
     """Scrollable level table. -> 'close', 'quit' or 'refresh'."""
     st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": "",
           "col": not OPT["lite"], "mode": None}
-    linecache, upcache = {}, {}
+    linecache, upcache, estcache = {}, {}, {}
+    nst = {"recs": None, "err": None, "src": "", "have": False, "net_tried": False}
+
+    def nist_matched(allow_net):
+        """NIST lines: from disk (PERIODIC_LINES_DIR / cache) always, from the network only when
+        the NIST state asked for it.  Reloading clears the merged-list caches."""
+        need = nst["recs"] is None or (allow_net and not nst["net_tried"] and (not nst["have"] or force_lines))
+        if need:
+            if allow_net:
+                win.erase()
+                put(win, 1, 2, "fetching NIST ASD lines with transition probabilities for %s %s ..." % (sym, roman(stage)))
+                win.refresh()
+                nst["net_tried"] = True
+            recs, nst["src"], nst["err"] = get_nist_lines(sym, stage, force_lines and allow_net, allow_net)
+            nst["have"] = bool(nst["src"]) and nst["err"] is None
+            nst["recs"] = match_nist(recs, rows)
+            linecache.clear()
+            upcache.clear()
+        return nst["recs"]
+
+    def estimates(mode):
+        if mode not in estcache:
+            estcache[mode] = m1_lines(rows) if mode == "M1" else e1_lines(rows, stage)
+        return estcache[mode]
 
     def lines_all(mode):
+        nist = nist_matched(mode == "NIST")
         if mode not in linecache:
-            linecache[mode] = m1_lines(rows) if mode == "M1" else e1_lines(rows, stage)
+            est = estimates("M1") + estimates("E1") if mode == "NIST" else estimates(mode)
+            linecache[mode] = merge_lines(est, nist, mode)
         return linecache[mode]
 
     def by_upper(mode):
         """id(upper level) -> lines from it above the A cut, strongest first."""
+        lines_ = lines_all(mode)                 # may (re)load NIST data and reset upcache
         key = (mode, OPT["cut"][mode])
         if key not in upcache:
             d, cut = {}, MODES[mode]["cuts"][OPT["cut"][mode]]
-            for t in lines_all(mode):
+            for t in lines_:
                 if t[0] >= cut:
                     d.setdefault(id(t[2]), []).append(t)
             upcache[key] = d
@@ -1402,21 +1801,20 @@ def levels_view(win, sym, stage, rows, source, err):
             top = st["cur"] - page + 1
         uname = UNITS[st["unit"]][0]
         mode = st["mode"]
-        annw = (45 if mode == "E1" else 34) if mode else 0
+        annw = 58 if mode else 0
         narrow = bool(mode) and w < 43 + annw + 12          # tags on, little room: hide the configuration
         termw, ew = (9, 12) if narrow else (12, 14)
         confw = 0 if narrow else max(10, min(60, w - 43 - annw))
         m1map = by_upper(mode) if mode else {}
-        vidx = {id(r_): i_ for i_, r_ in enumerate(view)} if mode == "E1" else {}
+        vidx = {id(r_): i_ for i_, r_ in enumerate(view)} if mode in ("E1", "NIST") else {}
 
         if throttle.should_draw(win):
             win.erase()
             put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
             put(win, 1, 1, "%5s %s%-*s %-6s %*s" % ("#", ("%-*s " % (confw, "configuration")) if confw else "",
                                                     termw, "term", "J", ew, "E / " + uname)
-                + ("  %-40s" % ("%s →%s  λ_%s  A/s⁻¹" % (
-                    mode, "J_l" if mode == "M1" else "#lev", "air" if OPT["m1air"] else "vac")
-                    + ("  method" if mode == "E1" else ""))
+                + ("  %-50s" % ("%s →%s  λ_%s  A/s⁻¹   source / est" % (
+                    mode, "J_l" if mode == "M1" else "#lev", "air" if OPT["m1air"] else "vac"))
                    if mode else ""), curses.A_DIM | curses.A_UNDERLINE)
             if st["col"] and n:
                 lx = 1 + len("%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage))) + 3
@@ -1437,18 +1835,27 @@ def levels_view(win, sym, stage, rows, source, err):
                 y = 2 + i
                 lines_here = m1map.get(id(view[k])) if mode else None
                 if lines_here:
-                    A_, lam_, _, lo_, _, Jl_, _ = lines_here[0]
+                    A_, lam_, _, lo_, _, Jl_, tag_, info_ = lines_here[0]
                     ax = 1 + len("".join(cells)) + 2
                     more = " +%d" % (len(lines_here) - 1) if len(lines_here) > 1 else ""
                     on = k == st["cur"]
-                    tgt = fmt_J(Jl_) if mode == "M1" else "#%d" % (vidx.get(id(lo_), -1) + 1)
+                    if mode == "M1":
+                        tgt = fmt_J(Jl_)
+                    else:
+                        tgt = "#%d" % (vidx[id(lo_)] + 1) if id(lo_) in vidx else fmt_J(Jl_) or "?"
                     put(win, y, ax, "→%-5s" % tgt, curses.A_REVERSE if on else curses.A_BOLD)
                     put(win, y, ax + 7, "%-13s" % fmt_lam(lam_, OPT["m1air"]),
                         curses.A_REVERSE if on else lam_attr(lam_))
-                    put(win, y, ax + 21, "%-9.3g" % A_, curses.A_REVERSE if on else a_attr(A_, mode))
-                    tail = (" %-7s" % lines_here[0][6] if mode == "E1" else "") + more
-                    put(win, y, ax + 30, tail, curses.A_REVERSE if on else
-                        (method_attr(lines_here[0][6]) if mode == "E1" else 0))
+                    put(win, y, ax + 21, "%-9.2e" % A_, curses.A_REVERSE if on else a_attr(A_, line_kind(info_, mode)))
+                    if info_["nist"] is not None:
+                        src_txt, src_attr = "N:%-4s" % (info_["acc"] or "?"), curses.color_pair(LV_EVEN) | curses.A_BOLD
+                    elif mode == "E1":
+                        src_txt, src_attr = "%-6s" % tag_, method_attr(tag_)
+                    else:
+                        src_txt, src_attr = "est   ", curses.A_DIM
+                    est_txt = (" est %.2e" % info_["est"]) if (info_["nist"] is not None and info_["est"]) else ""
+                    put(win, y, ax + 31, src_txt, curses.A_REVERSE if on else src_attr)
+                    put(win, y, ax + 31 + len(src_txt), more + est_txt, curses.A_REVERSE if on else curses.A_DIM)
                 if k == st["cur"] or not st["col"]:
                     attr = curses.A_REVERSE if k == st["cur"] else (curses.A_BOLD if hit(view[k]) else 0)
                     put(win, y, 1, "".join(cells), attr)
@@ -1470,8 +1877,9 @@ def levels_view(win, sym, stage, rows, source, err):
                     put(win, 3 + i // width, 2, msg[i:i + width])
             put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
                 n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source)
-                + ("   %s: %d lines, A ≥ %g  (f next  F list  t cut  a air/vac)" % (
-                    mode, sum(len(v) for v in m1map.values()), MODES[mode]["cuts"][OPT["cut"][mode]])
+                + ("   %s: %d lines, A ≥ %g  %s  (f next  F list  t cut  a air/vac)" % (
+                    mode, sum(len(v) for v in m1map.values()), MODES[mode]["cuts"][OPT["cut"][mode]],
+                    nist_status(nst))
                    if mode else ""),
                 curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
@@ -1522,7 +1930,7 @@ def levels_view(win, sym, stage, rows, source, err):
             st["col"] = not st["col"]
             st["msg"] = "colour " + ("on" if st["col"] else "off")
         elif c == "f":
-            st["mode"] = {None: "M1", "M1": "E1", "E1": None}[st["mode"]]
+            st["mode"] = {None: "M1", "M1": "E1", "E1": "NIST", "NIST": None}[st["mode"]]
             if st["mode"] == "M1":
                 nl = len(lines_all("M1"))
                 st["msg"] = ("M1: %d in-term lines (empirical A, pure LS)  f again: allowed lines" % nl) if nl \
@@ -1530,10 +1938,16 @@ def levels_view(win, sym, stage, rows, source, err):
             elif st["mode"] == "E1":
                 nl = len(lines_all("E1"))
                 st["msg"] = "E1: %d candidate allowed lines, hydrogenic f estimates  F list  t cut" % nl
+            elif st["mode"] == "NIST":
+                nl = len(lines_all("NIST"))
+                st["msg"] = ("NIST: %d lines with A (%s)  F list" % (nl, nst["src"])) if nst["have"] \
+                    else nist_status(nst)
             else:
                 st["msg"] = "line tags off"
+            if st["mode"] in ("M1", "E1") and not nst["have"]:
+                st["msg"] += "   [estimates only: f to the NIST state queries NIST]"
         elif c == "F":
-            res = lines_view(win, sym, stage, lines_all(st["mode"] or "M1"), st["mode"] or "M1")
+            res = lines_view(win, sym, stage, lines_all(st["mode"] or "M1"), st["mode"] or "M1", nst)
             if res == "quit":
                 return "quit"
             if isinstance(res, tuple) and res[1] in view:
@@ -1579,19 +1993,32 @@ def levels_view(win, sym, stage, rows, source, err):
                 st["msg"] = "E492: Not an editor command: " + word
 
 
-def lines_view(win, sym, stage, lines, mode):
-    """Full line list, strongest first. -> 'close', 'quit' or ('goto', upper, mode)."""
-    st = {"cur": 0, "count": "", "pend": "", "msg": "", "bylam": False}
+def lines_view(win, sym, stage, lines, mode, nst=None):
+    """Full line list, strongest first, with NIST and estimated A side by side.
+    -> 'close', 'quit' or ('goto', upper, mode)."""
+    st = {"cur": 0, "count": "", "pend": "", "msg": "", "sort": 0}
     throttle = Throttle()
     top = 0
     M = MODES[mode]
+    SORTS = ["A", "λ", "est/NIST"]
+
+    def ratio(t):
+        i = t[7]
+        return i["est"] / i["nist"] if (i["est"] and i["nist"]) else None
 
     def visible():
         cut = M["cuts"][OPT["cut"][mode]]
         v_ = [t for t in lines if t[0] >= cut]
-        return sorted(v_, key=lambda t: t[1]) if st["bylam"] else v_
+        if st["sort"] == 1:
+            return sorted(v_, key=lambda t: t[1])
+        if st["sort"] == 2:      # worst agreement first, lines without both values last
+            return sorted(v_, key=lambda t: -abs(math.log10(ratio(t))) if ratio(t) else 1e9)
+        return v_
 
     v = visible()
+    n_both = sum(1 for t in lines if t[7]["est"] and t[7]["nist"])
+    rs = sorted(math.log10(ratio(t)) for t in lines if ratio(t))
+    med = (10 ** rs[len(rs) // 2]) if rs else None
     while True:
         h, w = win.getmaxyx()
         page = max(1, h - 5)
@@ -1602,42 +2029,54 @@ def lines_view(win, sym, stage, lines, mode):
         if st["cur"] >= top + page:
             top = st["cur"] - page + 1
         lamh = "λ_" + ("air" if OPT["m1air"] else "vac")
+        lastw = 7 if mode != "NIST" else 6
+        extra_w = max(0, w - 2 - 76)
+        confw = max(0, min(30, (extra_w - 8) // 2))
         if throttle.should_draw(win):
             win.erase()
             put(win, 0, 1, "%s %s  %s" % (sym, roman(stage), M["title"]), curses.A_BOLD)
-            put(win, 1, 1, M["formula"] + ";  Enter jumps to the upper level", curses.A_DIM)
-            if mode == "M1":
-                confw = max(8, min(40, w - 93))
-                put(win, 2, 1, "%4s %-*s %-10s %-11s %12s %12s  %-14s %10s %6s" % (
-                    "#", confw, "configuration", "term", "J_u → J_l", "E_u/cm⁻¹",
-                    "E_l/cm⁻¹", lamh, "A/s⁻¹", "f"), curses.A_DIM | curses.A_UNDERLINE)
-            else:
-                confw = max(0, min(30, (w - 76) // 2))
-                put(win, 2, 1, ("%4s %-8s %-5s   %-8s %-5s %-14s %10s %-7s" % (
-                    "#", "upper", "J", "lower", "J", lamh, "A/s⁻¹", "method"))
-                    + ((" %-*s %-*s" % (confw, "upper conf", confw, "lower conf")) if confw >= 6 else ""),
-                    curses.A_DIM | curses.A_UNDERLINE)
+            nist_note = ("   " + nist_status(nst)) if nst is not None else ""
+            put(win, 1, 1, M["formula"] + nist_note, curses.A_DIM)
+            last = {"M1": "f", "E1": "method", "NIST": "type"}[mode]
+            head = "%4s %-8s %-5s  %-8s %-5s %-12s %9s %-3s %9s %-*s" % (
+                "#", "upper", "J", "lower", "J", lamh, "A_NIST", "acc", "A_est", lastw, last)
+            if extra_w >= 8:
+                head += " %7s" % "est/N"
+            if confw >= 6:
+                head += " %-*s %-*s" % (confw, "upper conf", confw, "lower conf")
+            put(win, 2, 1, head, curses.A_DIM | curses.A_UNDERLINE)
             for i in range(page):
                 k = top + i
                 if k >= n:
                     break
-                A, lam, up, lo, Ju, Jl, extra = v[k]
+                A, lam, up, lo, Ju, Jl, tag, info = v[k]
                 y, on = 3 + i, k == st["cur"]
+                kind = line_kind(info, mode)
                 if mode == "M1":
-                    cells = [("%4d " % (k + 1), curses.A_DIM), ("%-*s " % (confw, up[0][:confw]), 0),
-                             ("%-10s " % up[1][:10], 0), ("%-11s " % ("%s → %s" % (fmt_J(Ju), fmt_J(Jl))), 0),
-                             ("%12s " % fmt_e(up[3], 0, up[4]), 0), ("%12s  " % fmt_e(lo[3], 0, lo[4]), 0),
-                             ("%-14s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
-                             ("%10.3g " % A, a_attr(A, mode)), ("%6.3f" % extra, curses.A_DIM)]
+                    last_txt, last_attr = ("%-7.3f" % tag) if isinstance(tag, float) else "%-7s" % "-", curses.A_DIM
+                elif mode == "E1":
+                    last_txt = "%-7s" % (tag if tag else "NIST")
+                    last_attr = method_attr(tag) if tag else curses.color_pair(LV_EVEN)
                 else:
-                    cells = [("%4d " % (k + 1), curses.A_DIM),
-                             ("%-8s " % up[1][:8], 0), ("%-5s → " % fmt_J(Ju), 0),
-                             ("%-8s " % lo[1][:8], 0), ("%-5s " % fmt_J(Jl), 0),
-                             ("%-14s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
-                             ("%10.3g " % A, a_attr(A, mode)), ("%-7s " % extra, method_attr(extra))]
-                    if confw >= 6:
-                        cells += [("%-*s " % (confw, up[0][:confw]), curses.A_DIM),
-                                  ("%-*s" % (confw, lo[0][:confw]), curses.A_DIM)]
+                    last_txt, last_attr = "%-6s" % (info["type"] or "E1")[:6], curses.A_DIM
+                cells = [("%4d " % (k + 1), curses.A_DIM),
+                         ("%-8s " % up[1][:8], 0), ("%-4s→ " % (fmt_J(Ju) if Ju is not None else "?"), 0),
+                         ("%-8s " % lo[1][:8], 0), ("%-5s " % (fmt_J(Jl) if Jl is not None else "?"), 0),
+                         ("%-12s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
+                         (("%9.2e " % info["nist"]) if info["nist"] is not None else "%9s " % "-",
+                          a_attr(info["nist"], kind) if info["nist"] is not None else curses.A_DIM),
+                         ("%-3s " % (info["acc"] or "")[:3], curses.color_pair(LV_EVEN)),
+                         (("%9.2e " % info["est"]) if info["est"] else "%9s " % "-",
+                          a_attr(info["est"], kind) if info["est"] else curses.A_DIM),
+                         (last_txt, last_attr)]
+                if extra_w >= 8:
+                    r_ = ratio(v[k])
+                    bad = r_ is not None and (r_ > 3 or r_ < 1 / 3.0)
+                    cells.append((" %7s" % (("%.2f" % r_) if r_ else "-"),
+                                  (curses.color_pair(LV_BASE + 1) if bad else curses.A_DIM)))
+                if confw >= 6:
+                    cells += [(" %-*s" % (confw, up[0][:confw]), curses.A_DIM),
+                              (" %-*s" % (confw, lo[0][:confw]), curses.A_DIM)]
                 x = 1
                 for txt, a in cells:
                     put(win, y, x, txt, curses.A_REVERSE if on else a)
@@ -1647,13 +2086,13 @@ def lines_view(win, sym, stage, lines, mode):
                 why = (" above A = %g s^-1 (t to change)" % cut) if cut else (
                     ": needs two levels of the same configuration and LS term with J differing by 1"
                     if mode == "M1" else
-                    ": needs opposite-parity terms whose configurations differ by one electron")
+                    ": needs opposite-parity terms whose configurations differ by one electron"
+                    if mode == "E1" else ": NIST has no transition probabilities for this ion, or they could not be fetched")
                 put(win, 4, 2, "no %s lines%s" % (mode, why))
-            put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s   t cut  s sort  a air/vac  "
-                "Enter goto  q back" % (n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]],
-                                         "λ" if st["bylam"] else "A")
-                + ("   method: dn0 same-shell, kram Kramers, cap/f=1 capped, ci mixing-prone, ? penetrating"
-                   if mode == "E1" else ""), curses.A_DIM)
+            summary = ("   %d with both values, median est/NIST %.2f" % (n_both, med)) if med else ""
+            put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s%s   t cut  s sort  a air/vac  Enter goto  q back" % (
+                n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]], SORTS[st["sort"]], summary),
+                curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
             put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
             win.refresh()
@@ -1666,10 +2105,10 @@ def lines_view(win, sym, stage, lines, mode):
         if ch == curses.KEY_MOUSE:
             ev = read_mouse()
             if ev and n:
-                kind, mx, my = ev
-                if kind == "up":
+                kind_, mx, my = ev
+                if kind_ == "up":
                     st["cur"] = max(0, st["cur"] - 3)
-                elif kind == "down":
+                elif kind_ == "down":
                     st["cur"] = min(n - 1, st["cur"] + 3)
                 elif 0 <= my - 3 < page and top + my - 3 < n:
                     st["cur"] = top + my - 3
@@ -1698,8 +2137,9 @@ def lines_view(win, sym, stage, lines, mode):
             OPT["cut"][mode] = (OPT["cut"][mode] + 1) % len(M["cuts"])
             v = visible()
         elif c == "s":
-            st["bylam"] = not st["bylam"]
+            st["sort"] = (st["sort"] + 1) % len(SORTS)
             v = visible()
+            st["msg"] = "sort: " + SORTS[st["sort"]] + ("  (worst agreement first)" if st["sort"] == 2 else "")
         elif c == "a":
             OPT["m1air"] = not OPT["m1air"]
         elif c == ":":
@@ -1774,8 +2214,8 @@ def run(win, start):
             put(win, 1, 2, "querying NIST ASD for %s %s ..." % (sym, roman(stage)))
             win.refresh()
             rows, src, err = get_levels(sym, stage, force)
+            res = levels_view(win, sym, stage, rows, src, err, force_lines=force)
             force = False
-            res = levels_view(win, sym, stage, rows, src, err)
             if res == "quit":
                 return "quit"
             if res == "refresh":

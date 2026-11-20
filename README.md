@@ -130,14 +130,20 @@ This is a pure-LS estimate, so expect it to degrade for heavy or highly charged 
 | Case | Oscillator strength | Tag |
 | --- | --- | --- |
 | Same shell (Δn = 0) | f₀ = (ΔE/Ry)/3 · l_>/(2l_a+1) · σ², with σ = (3/2)(n̄*/ζ)√(n̄*² − l_>²) | `dn0` |
-| Δn ≠ 0 | Kramers' semiclassical formula with a Gaunt factor of 0.8, f_K = 0.8 · 32/(3π√3) · 1/(n_lo⁵ n_hi³) · (1/n_lo² − 1/n_hi²)⁻³, with integer n from the configuration, then capped as f = min(f_K, f₀, 1) | `kram`, or `cap` when f₀ was the smaller |
-| No ionization limit in the list | f = min(f_K, 1), or 1 | `f=1` |
+| Δn ≠ 0 | Exact hydrogenic f_H(n_a l_a → n_b l_b) with the integer n of the configuration, blended with f₀ by how much of the integer Δn survives in the effective quantum numbers: f = f₀^(1−x) · f_H^x, with x = Δn*/Δn clipped to the range 0–1. Large quantum defects shrink Δn*, and the line then behaves more like a same-shell line | `hyd` (x > 0.9), `mix` |
+| No ionization limit in the list | f = f_H for Δn ≠ 0, otherwise 1 | `hyd`, `f=1` |
+| Any of the above reaching f ≥ 1 | capped at 1 | `f=1` |
 
-The result is then:
-- scaled by the occupancy factor N_b × (vacancies in n_a l_a)/(2(2l_a+1))
-- shared among the allowed lower levels of each lower configuration in proportion to (2J_l+1)
+The result is then scaled by the occupancy factor N_b × (vacancies in n_a l_a)/(2(2l_a+1)), and split among the lower levels with LS recoupling (Wigner 6j) factors. Each factor sums to 1, so an upper level's total decay rate is unchanged and only its distribution between lines is affected:
 
-A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydrogenic picture is poor.
+- **J branching** within a multiplet, whenever both terms are LS: F_J = (2J_l+1){L_u J_u S; J_l L_l 1}², normalised over J_l.
+- **Term branching** when both configurations show the same parent term L_c (e.g. `3d6.(5D).4p` → `3d6.(5D).4s`), or the core is closed: F_term = (2L_l+1){l_b L_u L_c; L_l l_a 1}², normalised over the lower terms the parent allows.
+- **No stated parent** (e.g. `4s2.4p2`, `3d7`): the lower terms present share by (2L_l+1)(2S+1), and the line is tagged `~`.
+- **Any non-LS term** in the group: fallback to (2J_l+1) sharing.
+
+The 6j symbols use Racah's formula and are cached, so this costs almost nothing.
+
+A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydrogenic picture is poor; a `~` marks a line whose lower-term split had no parent to go on.
 
 **Inner-subshell jumps (`ci`).** These are lines of the type ns np^(k+1) → ns² np^k, such as C II 2s2p² → 2s²2p or Se III 4s4p³ → 4s²4p². Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
 - the p electron uses the valence binding of the lower level, E_limit − E_lower
@@ -145,16 +151,22 @@ A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydro
 
 This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier ions, though, ns np^(k+1) mixes strongly with ns² np^(k−1) nd, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III 4s4p³ → 4s²4p², the estimate is about 8×10⁸ s⁻¹, against about 5×10⁷ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
 
-**Typical accuracy** against NIST:
-- strong resonance lines (Na D, Lyα, Ca II H & K, Mg II): within about 10%
-- Δn ≠ 0 lines: often 2–3× high
-- fine-structure splits within a multiplet: crude, because the (2J_l+1) sharing ignores the LS 6j factors
+**Typical accuracy** against reference values:
+- Lyα and Hα: exact
+- strong resonance lines (Na D, Ca II H & K, Mg II): within about 10%
+- most Δn ≠ 0 lines (Na 4s→3p, Ca II 8542/8662, Se III 4p5s → 4p²): within about 2×
+- fine-structure splits within a multiplet: correct in pure LS (Hα components exact, C II 1334/1336 Å within 4%, the Ca II infrared triplet ratios and Fe II 2600/2626 Å right); heavier ions drift as intermediate coupling sets in
+
+**Known failures:**
+- `ci` lines (below): can be ~10× too high
+- alkali principal-series lines beyond the first, such as Na 3303 Å (4p → 3s): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
+- lines from a singlet upper level of ns np → ns², such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
 
 ### Where the tags appear
 
 - **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1), then λ, A and, for E1, the method tag. `+N` means N more lines. In narrow windows the configuration column is hidden to make room.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
-- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when the hydrogenic formula was used, yellow when the value was capped, and red for `?` and `ci`.
+- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`.
 - **Air wavelengths** (`a`) use the refractive-index formula of [Morton (2000), ApJS 130, 403](https://doi.org/10.1086/317349) above 2000 Å.
 
 ## Environment variables and cache
