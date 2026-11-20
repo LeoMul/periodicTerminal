@@ -139,6 +139,12 @@ The result is then:
 
 A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydrogenic picture is poor.
 
+**Inner-subshell jumps (`ci`).** These are lines of the type ns np^(k+1) → ns² np^k, such as C II 2s2p² → 2s²2p or Se III 4s4p³ → 4s²4p². Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
+- the p electron uses the valence binding of the lower level, E_limit − E_lower
+- the s electron is bound more deeply by the excitation energy, E_limit − E_lower + ΔE
+
+This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier ions, though, ns np^(k+1) mixes strongly with ns² np^(k−1) nd, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III 4s4p³ → 4s²4p², the estimate is about 8×10⁸ s⁻¹, against about 5×10⁷ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
+
 **Typical accuracy** against NIST:
 - strong resonance lines (Na D, Lyα, Ca II H & K, Mg II): within about 10%
 - Δn ≠ 0 lines: often 2–3× high
@@ -148,7 +154,7 @@ A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydro
 
 - **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1), then λ, A and, for E1, the method tag. `+N` means N more lines. In narrow windows the configuration column is hidden to make room.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
-- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when the hydrogenic formula was used, yellow when the value was capped, and red for `?`.
+- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when the hydrogenic formula was used, yellow when the value was capped, and red for `?` and `ci`.
 - **Air wavelengths** (`a`) use the refractive-index formula of [Morton (2000), ApJS 130, 403](https://doi.org/10.1086/317349) above 2000 Å.
 
 ## Environment variables and cache

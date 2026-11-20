@@ -632,6 +632,7 @@ VHELP = [
     "f                  cycle line tags: M1 (in-term dJ=1, empirical A) -> E1 allowed -> off",
     "                   E1: one-electron LS-allowed lines, hydrogenic f (dn0 / Kramers, capped)",
     "                   method tag: dn0 same-shell, kram Kramers, cap / f=1 capped, ? penetrating",
+    "                   ci: ns np^(k+1) -> ns2 np^k type, often much weaker (configuration mixing)",
     "F                  full list for the current mode, strongest first (Enter -> upper level)",
     "t / a              cycle minimum A shown / air vs vacuum wavelengths",
     "o                  toggle energy-sorted / NIST order",
@@ -1016,7 +1017,7 @@ def lam_attr(lam):
 
 def method_attr(tag):
     """dn0/kram: hydrogenic formula used; cap/f=1: limited; '?': penetrating orbital."""
-    if "?" in tag:
+    if "?" in tag or "ci" in tag:
         return curses.color_pair(LV_BASE + 1)                  # red-ish: treat with care
     if tag.startswith(("dn0", "kram")):
         return curses.color_pair(LV_BASE + 2)                  # green
@@ -1044,7 +1045,9 @@ def a_attr(A, mode="M1"):
 #   that lower configuration in proportion to (2J_l+1), and scaled by occupancy:
 #     A_line = 6.670e15 (2l_a+1)/(2l_b+1) f / lambda[A]^2 * N_b * vac_a/(2(2l_a+1)) * w_line
 #   Method tags: dn0, kram (Kramers), cap (f0 smaller than Kramers), f=1; '?' marks a d/f
-#   orbital with n*^2 <= l(l+1), where the hydrogenic picture is poor.
+#   orbital with n*^2 <= l(l+1), where the hydrogenic picture is poor; 'ci' marks an
+#   inner-subshell jump (ns np^(k+1) -> ns2 np^k), where configuration mixing often cancels
+#   much of the strength.
 RY_CM = 109737.31568
 _ORB = re.compile(r"(\d+)([spdfghik])(\d*)")
 _LL = "spdfghik"
@@ -1081,8 +1084,13 @@ def one_jump(o1, o2):
 _KRAMERS = 0.8 * 32.0 / (3 * math.pi * math.sqrt(3))
 
 
-def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta):
-    """One-electron absorption f for a -> b -> (f, method tag)."""
+def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
+    """One-electron absorption f for a -> b -> (f, method tag).
+    inner: a is an inner subshell of the lower configuration (b is already occupied there,
+    e.g. ns2 np^k <- ns np^(k+1)).  Then the b electron is bound like a valence electron of the
+    lower level, E_limit - E_lo, and the a electron more deeply by the excitation energy,
+    E_limit - E_lo + dE.  These lines are tagged 'ci': ns np^(k+1) mixes strongly with
+    ns2 np^(k-1) nd, which can cancel much of the strength."""
     (na, la), (nb, lb) = ka, kb
     lg = max(la, lb)
     fK = None
@@ -1091,13 +1099,17 @@ def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta):
         fK = _KRAMERS / (n_lo ** 5 * n_hi ** 3) / (1.0 / n_lo ** 2 - 1.0 / n_hi ** 2) ** 3
     if elim is None or E_up >= elim:
         return (min(fK, 1.0), "kram" if fK < 1 else "f=1") if fK is not None else (1.0, "f=1")
-    nsa = zeta * math.sqrt(RY_CM / (elim - E_lo))
-    nsb = zeta * math.sqrt(RY_CM / (elim - E_up))
+    if inner:
+        nsa = zeta * math.sqrt(RY_CM / (elim - E_lo + (E_up - E_lo)))
+        nsb = zeta * math.sqrt(RY_CM / (elim - E_lo))
+    else:
+        nsa = zeta * math.sqrt(RY_CM / (elim - E_lo))
+        nsb = zeta * math.sqrt(RY_CM / (elim - E_up))
     nbar = 0.5 * (nsa + nsb)
     sig = 1.5 * nbar / zeta * math.sqrt(max(nbar * nbar - lg * lg, 0.25))
     f0 = (E_up - E_lo) / RY_CM / 3.0 * lg / (2 * la + 1) * sig * sig
     pen = any(l >= 2 and ns * ns <= l * (l + 1) for l, ns in ((la, nsa), (lb, nsb)))
-    q = "?" if pen else ""
+    q = (" ci" if inner else "") + ("?" if pen else "")
     if fK is None:
         return (min(f0, 1.0), ("dn0" if f0 < 1 else "f=1") + q)
     f = min(fK, f0, 1.0)
@@ -1151,17 +1163,18 @@ def e1_lines(rows, stage=1):
                     if abs(J1 - J2) > 1 + 1e-9 or (J1 == 0 and J2 == 0) or r1[3] == r2[3]:
                         continue
                     if r1[3] > r2[3]:     # upper in term 1: the electron sits in extra_in_1
-                        cand.append((r1, J1, t1, r2, J2, keys[k][0], extra_in_2, extra_in_1, note))
+                        cand.append((r1, J1, t1, r2, J2, keys[k][0], extra_in_2, extra_in_1, note, t2))
                     else:
-                        cand.append((r2, J2, t2, r1, J1, keys[i][0], extra_in_1, extra_in_2, note))
+                        cand.append((r2, J2, t2, r1, J1, keys[i][0], extra_in_1, extra_in_2, note, t1))
     # (2J_l+1) sharing: per upper level and lower configuration
     wsum = {}
-    for up, Ju, tu, lo, Jl, lconf, ka, kb, note in cand:
+    for up, Ju, tu, lo, Jl, lconf, ka, kb, note, tl in cand:
         key = (id(up), lconf)
         wsum[key] = wsum.get(key, 0.0) + 2 * Jl + 1
     out = []
-    for up, Ju, tu, lo, Jl, lconf, ka, kb, note in cand:
-        f, tag = f_hydrogenic(ka, kb, lo[3], up[3], elim, zeta)
+    for up, Ju, tu, lo, Jl, lconf, ka, kb, note, tl in cand:
+        inner = tl["occ"].get(kb, 0) > 0
+        f, tag = f_hydrogenic(ka, kb, lo[3], up[3], elim, zeta, inner)
         cap_a = 2 * (2 * ka[1] + 1)
         occ = tu["occ"].get(kb, 1) * max(0, cap_a - tu["occ"].get(ka, 0)) / cap_a
         if occ <= 0 or f <= 0:
@@ -1639,7 +1652,7 @@ def lines_view(win, sym, stage, lines, mode):
             put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s   t cut  s sort  a air/vac  "
                 "Enter goto  q back" % (n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]],
                                          "λ" if st["bylam"] else "A")
-                + ("   method: dn0 same-shell, kram Kramers, cap/f=1 capped, ? penetrating"
+                + ("   method: dn0 same-shell, kram Kramers, cap/f=1 capped, ci mixing-prone, ? penetrating"
                    if mode == "E1" else ""), curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
             put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
