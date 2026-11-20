@@ -7,17 +7,18 @@ Keys:   ? for help.  Enter on an element queries NIST ASD energy levels.
 Mouse:  click selects, double-click / right-click opens levels, wheel scrolls (:set nomouse to turn off)
 Env:    PERIODIC_LEVELS_DIR=dir  look there first for levels_cm_<El>+<charge>.txt files
         PERIODIC_OPACITY=10..100  cell opacity (default 70)   PERIODIC_NO_MOUSE=1
+        PERIODIC_ASPECT=2.0       font height:width ratio, for square cells
+        PERIODIC_SPACING=0        no gaps between cells
+        PERIODIC_CACHE_MB=500     cap on ~/.cache/periodic (oldest files removed first)
+        PERIODIC_LITE=1           start in lite mode (L toggles)
 """
 import csv
 import curses
 import io
 import os
 import re
-import ssl
 import sys
 import time
-import urllib.parse
-import urllib.request
 
 os.environ.setdefault("ESCDELAY", "25")
 
@@ -309,7 +310,7 @@ def isdig(c):
     return c != "" and c in "0123456789"
 
 
-MIN_H, MIN_W = 19, 56
+MIN_H, MIN_W = 16, 56
 
 # ---- mouse (PRESSED events only; double-click timing is done here, so it works everywhere)
 _B1 = getattr(curses, "BUTTON1_PRESSED", 0)
@@ -381,7 +382,43 @@ def detect_light():
     return v.split(";")[-1] in ("7", "15") if v else False
 
 
-OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light()}
+def _env_float(name, default, lo, hi):
+    try:
+        return max(lo, min(hi, float(os.environ.get(name, default))))
+    except ValueError:
+        return default
+
+
+OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light(),
+       "aspect": _env_float("PERIODIC_ASPECT", 2.0, 1.0, 3.0),
+       "space": os.environ.get("PERIODIC_SPACING", "1") not in ("0", "off", "no"),
+       "lite": os.environ.get("PERIODIC_LITE", "0") not in ("0", "", "off", "no")}
+
+
+def input_pending(win):
+    """True if another key/mouse event is already queued (held key, wheel flood)."""
+    win.nodelay(True)
+    try:
+        c = win.getch()
+    finally:
+        win.nodelay(False)
+    if c == -1:
+        return False
+    curses.ungetch(c)
+    return True
+
+
+class Throttle:
+    """Skip redraws while input is queued, but never for longer than max_wait seconds."""
+    def __init__(self, max_wait=0.06):
+        self.max_wait, self.last = max_wait, 0.0
+
+    def should_draw(self, win):
+        now = time.monotonic()
+        if now - self.last >= self.max_wait or not input_pending(win):
+            self.last = now
+            return True
+        return False
 
 
 def init_fills():
@@ -395,68 +432,81 @@ def init_fills():
         curses.init_pair(FILL_BASE + i + 1, 231 if lum < 150 else 16, nearest_xterm(mix))
 
 
-# Typical terminal character height : width ratio (~2.0; tweak e.g. 1.8 or 2.2 to match your font)
-CHAR_ASPECT = 2.0
+def layout(h, w):
+    """Square cells: a terminal character is ~OPT['aspect'] times taller than wide, so a cell
+    rh lines tall is drawn fw = rh * aspect columns wide. Gaps follow the same rule: one blank
+    line between periods = aspect blank columns between groups.
+    -> dict(fw, rh, gh, gv, cw, x0, T) or None if the terminal is too small."""
+    a = OPT["aspect"]
+    for gv in ((1, 0) if OPT["space"] else (0,)):        # keep the gaps if at all possible
+        gh = max(1, int(round(gv * a))) if gv else 1
+        for rh in (5, 4, 3, 2, 1):
+            fw = max(2, int(round(rh * a)))
+            cw = fw + gh
+            gw = 18 * cw - gh                             # grid width
+            T = 9 * rh + 8 * gv + 1                       # grid height (7 periods + f-block + spacer)
+            if gw <= w - 2 and 1 + T + 1 + 2 + 1 <= h:    # header, grid, divider, 2-line info, status
+                return {"fw": fw, "rh": rh, "gh": gh, "gv": gv, "cw": cw, "T": T,
+                        "x0": max(1, (w - gw) // 2)}
+    return None
 
 
-CHAR_ASPECT = 2.0  # typical terminal cell height : width ratio
-
-
-def metrics(h, w):
-    """Scale cells smoothly with terminal size and zoom level."""
-    gap_y = 1 if h >= 26 else 0
-    # Overhead: header (1) + lanthanide gap (1) + divider (1) + info block (~6) + status (1) = ~10
-    avail_rows = max(9, h - 10 - 6 * gap_y)
-    max_rh_by_h = max(1, min(5, avail_rows // 9))
-
-    # Each column slot has width `cw` = `fw` (cell text) + `1` (horizontal gap)
-    max_cw_by_w = max(3, (w - 2) // 18)
-    ideal_cw_from_h = max(3, round(max_rh_by_h * CHAR_ASPECT) + 1)
-
-    cw = max(3, min(max_cw_by_w, ideal_cw_from_h))
-    # Derive row height from chosen cw so aspect stays balanced, while honoring height budget
-    rh_from_w = max(1, min(5, round((cw - 1) / CHAR_ASPECT)))
-    rh = max(1, min(max_rh_by_h, rh_from_w))
-
-    grid_w = 18 * cw - 1
-    x0 = max(1, (w - grid_w) // 2)
-    return cw, rh, gap_y, x0
-
-
-def cell_y(r, top, rh, gap_y=1):
+def cell_y(r, top, L):
+    rh, gv = L["rh"], L["gv"]
     if r <= 7:
-        return top + (r - 1) * (rh + gap_y)
-    # Lanthanides (row 9) and actinides (row 10) sit below a separator gap after period 7
-    base_after_p7 = top + 7 * rh + 6 * gap_y + 1
-    return base_after_p7 + (r - 9) * (rh + gap_y)
+        return top + (r - 1) * (rh + gv)
+    return top + 7 * (rh + gv) + 1 + (r - 9) * (rh + gv)  # extra spacer line above the f-block
 
 
 def hit_cell(win, mx, my):
     h, w = win.getmaxyx()
-    if h < MIN_H or w < MIN_W:
+    L = layout(h, w) if h >= MIN_H and w >= MIN_W else None
+    if not L:
         return None
-    cw, rh, gap_y, x0 = metrics(h, w)
     for z, (r, c) in POS.items():
-        y, x = cell_y(r, 1, rh,gap_y), x0 + (c - 1) * cw
-        if y <= my < y + rh and x <= mx < x + cw:
+        y, x = cell_y(r, 1, L), L["x0"] + (c - 1) * L["cw"]
+        if y <= my < y + L["rh"] + L["gv"] and x <= mx < x + L["cw"]:   # gaps count too
             return z
     return None
+
+
+def cell_lines(z, fw, rh):
+    """Text lines for one cell, vertically centred in rh lines -> [(text, kind)]."""
+    sym, name, mass = ELEMS[z]
+    if "." in mass:
+        ms = mass if len(mass) <= fw else ("%.1f" % float(mass))
+    else:
+        ms = "[" + mass + "]"
+    nm = name if len(name) <= fw else name[: fw - 1] + "."
+    if rh == 1:
+        body = [(sym, "sym")]
+    elif rh == 2:
+        body = [(str(z), "q"), (sym, "sym")]
+    elif rh == 3:
+        body = [(str(z), "q"), (sym, "sym"), (ms[:fw], "q")]
+    else:
+        body = [(str(z), "q"), (sym, "sym"), (nm, "q"), (ms[:fw], "q")]
+    pad = (rh - len(body) + 1) // 2
+    out = [("", "q")] * pad + body
+    return out + [("", "q")] * (rh - len(out))
 
 
 def draw(win, st):
     h, w = win.getmaxyx()
     win.erase()
-    if h < MIN_H or w < MIN_W:
+    L = layout(h, w) if h >= MIN_H and w >= MIN_W else None
+    if not L:
         put(win, 0, 0, "terminal too small (need %dx%d)" % (MIN_W, MIN_H))
         win.refresh()
         return
-    cw, rh, y_gap, x0 = metrics(h, w)
+    fw, rh, cw, x0, T = L["fw"], L["rh"], L["cw"], L["x0"], L["T"]
     top = 1
-    put(win, 0, x0, "PERIODIC", curses.A_BOLD)
-    put(win, 0, x0 + 10, "? help  :q quit  hjkl w/b  / search  Enter levels  c colour", curses.A_DIM)
+    title = "PERIODIC" + (" [lite]" if OPT["lite"] else "")
+    put(win, 0, x0, title, curses.A_BOLD)
+    put(win, 0, x0 + len(title) + 2, "? help  :q quit  hjkl w/b  / search  Enter levels  c colour  L lite",
+        curses.A_DIM)
 
     for z, (r, c) in POS.items():
-        sym, _, mass = ELEMS[z]
         cat = CAT_OF[z]
         base = curses.color_pair(cat + 1)
         sel = z == st["cur"]
@@ -464,42 +514,49 @@ def draw(win, st):
             attr = base | curses.A_REVERSE | curses.A_BOLD
         elif st["hl"] is not None and cat != st["hl"]:
             attr = base | curses.A_DIM                      # receded: colour text only
+        elif OPT["lite"]:
+            attr = base | curses.A_BOLD                     # lite: coloured text, no fill
         else:
             attr = curses.color_pair(FILL_BASE + cat + 1) | curses.A_BOLD   # solid block
         if z in st["matches"] and not sel:
             attr = (attr & ~curses.A_DIM) | curses.A_UNDERLINE | curses.A_BOLD
         quiet = attr if sel else (attr & ~curses.A_BOLD) | curses.A_DIM
-        y, x = cell_y(r, top, rh, y_gap), x0 + (c - 1) * cw
-        fw = max(2, cw - 1)                                 # one-column gap between cells
-        if rh == 1:
-            lines = [(sym, attr)]
-        else:
-            lines = [(str(z), quiet), (sym, attr | curses.A_BOLD)]
-            if rh >= 3:
-                ms = ("%.1f" % float(mass)) if "." in mass else "[" + mass + "]"
-                lines.append((ms[:fw], quiet))
-        for i, (t, a) in enumerate(lines):
-            put(win, y + i, x, t.center(fw), a)
+        y, x = cell_y(r, top, L), x0 + (c - 1) * cw
+        for i, (t, kind) in enumerate(cell_lines(z, fw, rh)):   # paint every line: full block
+            if t or sel or not OPT["lite"]:
+                put(win, y + i, x, t.center(fw), (attr | curses.A_BOLD) if kind == "sym" else quiet)
 
-    for (r, c, s) in ((6, 3, "*"), (7, 3, "**"), (9, 2, "*"), (10, 2, "**")):
-        y = cell_y(r, top, rh, y_gap) + (0 if rh == 1 else 1)
-        put(win, y, x0 + (c - 1) * cw, s.center(cw), curses.A_DIM)
+    for (r, c, s_) in ((6, 3, "*"), (7, 3, "**"), (9, 2, "*"), (10, 2, "**")):
+        put(win, cell_y(r, top, L) + rh // 2, x0 + (c - 1) * cw, s_.center(fw), curses.A_DIM)
 
-    last_bottom = cell_y(10, top, rh, y_gap) + rh
-    sy = last_bottom + 1
-    put(win, sy, x0, "-" * min(w - 2 - x0, 18 * cw), curses.A_DIM)
+    sy = top + T
+    put(win, sy, x0, "-" * min(w - 2 - x0, 18 * cw - L["gh"]), curses.A_DIM)
     z = st["cur"]
     sym, name, mass, period, group, block = info(z)
     col = curses.color_pair(CAT_OF[z] + 1)
-    put(win, sy + 1, x0, "%s (%s)" % (name, sym), col | curses.A_BOLD)
-    put(win, sy + 2, x0, "Z = %d   mass = %s   period %s   group %s   %s-block" % (z, mass, period, group, block))
-    put(win, sy + 3, x0, "category: ")
-    put(win, sy + 3, x0 + 10, CATS[CAT_OF[z]], col)
-    put(win, sy + 4, x0, "config:   " + config(z))
+    extra = []
     if st["hl"] is not None:
-        put(win, sy + 5, x0, "highlighting: %s  (c/C cycle, Esc clear)" % CATS[st["hl"]], curses.A_DIM)
+        extra.append("highlighting: %s (c/C, Esc)" % CATS[st["hl"]])
     if st["matches"]:
-        put(win, sy + 6, x0, "%d match(es)  n/N next/prev  Esc clear" % len(st["matches"]), curses.A_DIM)
+        extra.append("%d match(es) n/N Esc" % len(st["matches"]))
+    if h >= sy + 6 + len(extra):                            # roomy: four-line panel
+        put(win, sy + 1, x0, "%s (%s)" % (name, sym), col | curses.A_BOLD)
+        put(win, sy + 2, x0, "Z = %d   mass = %s   period %s   group %s   %s-block" % (z, mass, period, group, block))
+        put(win, sy + 3, x0, "category: ")
+        put(win, sy + 3, x0 + 10, CATS[CAT_OF[z]], col)
+        put(win, sy + 4, x0, "config:   " + config(z))
+        for i, e in enumerate(extra):
+            put(win, sy + 5 + i, x0, e, curses.A_DIM)
+    else:                                                   # short terminal: two-line panel
+        head = "%s (%s)" % (name, sym)
+        put(win, sy + 1, x0, head, col | curses.A_BOLD)
+        put(win, sy + 1, x0 + len(head) + 2,
+            "Z=%d  mass %s  period %s  group %s  %s-block" % (z, mass, period, group, block))
+        cat = CATS[CAT_OF[z]]
+        put(win, sy + 2, x0, cat, col)
+        put(win, sy + 2, x0 + len(cat) + 2, "config: " + config(z))
+        if extra and sy + 3 < h - 1:
+            put(win, sy + 3, x0, "   ".join(extra), curses.A_DIM)
 
     put(win, h - 1, 1, st["msg"][: w - 14])
     put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
@@ -554,7 +611,9 @@ HELP = [
     ":q :q! :wq :x :qa  quit             ZZ / ZQ   quit",
     ":26  :Fe  :iron    jump to an element",
     ":levels [stage]    e.g.  :levels II    :e Fe III",
-    ":set [no]mouse     mouse on / off",
+    ":set [no]mouse     mouse on / off       :set [no]spacing   gaps between cells",
+    "L  or  :set [no]lite   lite mode: no cell fills / level colours (for slow terminals)",
+    ":set aspect=2.0    font height/width ratio; raise if cells look tall, lower if wide",
     ":set opacity=70    cell opacity 10-100   :set background=light|dark",
     ":noh   :help       clear matches / this help       q  quit",
 ]
@@ -565,7 +624,9 @@ VHELP = [
     "Ctrl-f / Ctrl-b    page down / up",
     "gg / G             top / bottom   (12G -> row 12)",
     "/  n  N            search configuration or term, next, previous",
-    "u                  cycle units: cm-1 / eV / Ry",
+    "u                  cycle units: cm-1 / eV / Ry / Eh",
+    "c                  colour on / off: configuration by outer subshell (s p d f),",
+    "                   term by parity (even / odd*), energy red (low) -> blue (high)",
     "o                  toggle energy-sorted / NIST order",
     "r                  refetch from NIST (skip the cache)",
     "click row / header (header cycles units), wheel scrolls",
@@ -637,6 +698,39 @@ def ion_label(sym, stage):
 
 # ------------------------------------------------------- NIST energy levels
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "periodic")
+try:
+    CACHE_MAX = max(1, int(os.environ.get("PERIODIC_CACHE_MB", "500"))) * 1024 * 1024
+except ValueError:
+    CACHE_MAX = 500 * 1024 * 1024
+
+
+def prune_cache(keep=None, limit=None):
+    """Keep CACHE_DIR under the size cap by deleting the files with the oldest
+    modification times first (reads refresh the time, so this is least-recently-used).
+    Only CACHE_DIR is touched, never PERIODIC_LEVELS_DIR. -> bytes removed."""
+    limit = CACHE_MAX if limit is None else limit
+    try:
+        files = []
+        for e in os.scandir(CACHE_DIR):
+            if e.is_file(follow_symlinks=False):
+                stt = e.stat(follow_symlinks=False)
+                files.append((stt.st_mtime, stt.st_size, e.path))
+    except OSError:
+        return 0
+    total = sum(f[1] for f in files)
+    removed = 0
+    for _, size, path in sorted(files):
+        if total <= limit:
+            break
+        if keep and os.path.abspath(path) == os.path.abspath(keep):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        total -= size
+        removed += size
+    return removed
 LOCAL_DIR = os.environ.get("PERIODIC_LEVELS_DIR", "")
 UNITS = [
     ("cm-1", 1.0),
@@ -697,6 +791,7 @@ def _read_rows(path):
 
 
 def _ssl_context():
+    import ssl
     try:
         import certifi  # fixes CERTIFICATE_VERIFY_FAILED on some macOS pythons
         return ssl.create_default_context(cafile=certifi.where())
@@ -715,8 +810,13 @@ def get_levels(sym, stage, force=False):
                 return rows, "local file", None
         rows = _read_rows(cache)
         if rows:
+            try:
+                os.utime(cache)            # mark as recently used
+            except OSError:
+                pass
             return rows, "cache", None
     url = levels_url(sym, stage)
+    import urllib.request
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (periodic-tui)"})
         with urllib.request.urlopen(req, timeout=25, context=_ssl_context()) as r:
@@ -730,6 +830,7 @@ def get_levels(sym, stage, force=False):
             os.makedirs(CACHE_DIR, exist_ok=True)
             with open(dump, "w", encoding="utf-8") as f:
                 f.write(text)
+            prune_cache(keep=dump)
         except OSError:
             dump = "(could not save)"
         lines = [ln for ln in text.splitlines() if ln.strip()][:4]
@@ -740,9 +841,61 @@ def get_levels(sym, stage, force=False):
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(cache, "w", encoding="utf-8") as f:
             f.write(text)
+        prune_cache(keep=cache)
     except OSError:
         pass
     return rows, "NIST ASD", None
+
+
+# ---- colour coding for the level table
+LV_BASE = 40                       # pairs 41.. : subshell l, parity, limit, energy ramp
+LV_L = "spdfg"                     # outermost subshell -> pairs 41..45
+LV_EVEN, LV_ODD, LV_LIMIT = 46, 47, 48
+LV_RAMP = 50                       # pairs 50..59: energy, low (red) -> high (blue), like photon colour
+LV256 = {"l": [203, 114, 75, 177, 215], "even": 117, "odd": 216, "limit": 226,
+         "ramp": [196, 208, 214, 220, 154, 84, 49, 44, 39, 33]}
+
+
+def init_level_pairs(big):
+    try:
+        if big:
+            for i, c in enumerate(LV256["l"]):
+                curses.init_pair(LV_BASE + 1 + i, c, -1)
+            curses.init_pair(LV_EVEN, LV256["even"], -1)
+            curses.init_pair(LV_ODD, LV256["odd"], -1)
+            curses.init_pair(LV_LIMIT, LV256["limit"], -1)
+            for i, c in enumerate(LV256["ramp"]):
+                curses.init_pair(LV_RAMP + i, c, -1)
+        else:
+            C = curses
+            for i, c in enumerate((C.COLOR_RED, C.COLOR_GREEN, C.COLOR_BLUE, C.COLOR_MAGENTA, C.COLOR_YELLOW)):
+                curses.init_pair(LV_BASE + 1 + i, c, -1)
+            curses.init_pair(LV_EVEN, C.COLOR_CYAN, -1)
+            curses.init_pair(LV_ODD, C.COLOR_YELLOW, -1)
+            curses.init_pair(LV_LIMIT, C.COLOR_YELLOW, -1)
+            ramp = (C.COLOR_RED,) * 2 + (C.COLOR_YELLOW,) * 2 + (C.COLOR_GREEN,) * 2 + \
+                   (C.COLOR_CYAN,) * 2 + (C.COLOR_BLUE,) * 2
+            for i, c in enumerate(ramp):
+                curses.init_pair(LV_RAMP + i, c, -1)
+    except curses.error:
+        pass
+
+
+_SUBSHELL = re.compile(r"\d+([spdfghik])\d*")
+
+
+def outer_l(conf):
+    """'3d6.(5D).4s' -> 's' (the last open subshell written); '' if none."""
+    m = _SUBSHELL.findall(conf)
+    return m[-1] if m else ""
+
+
+def is_odd(term):
+    return term.rstrip().endswith(("*", "°"))
+
+
+def is_limit(conf, term):
+    return term.strip().lower() == "limit" or "limit" in conf.lower()
 
 
 def fmt_e(e, unit_i, flag):
@@ -883,7 +1036,28 @@ def stage_picker(win, z):
 
 def levels_view(win, sym, stage, rows, source, err):
     """Scrollable level table. -> 'close', 'quit' or 'refresh'."""
-    st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": ""}
+    st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": "",
+          "col": not OPT["lite"]}
+    throttle = Throttle()
+    emax = max((r[3] for r in rows), default=0.0) or 1.0
+    attr_cache = {}
+
+    def row_attrs(r):
+        """(conf, term, energy) colour attrs, or 'limit'; computed once per row."""
+        a = attr_cache.get(id(r))
+        if a is None:
+            conf, term, _, e, flag = r
+            if is_limit(conf, term):
+                a = "limit"
+            else:
+                ol = outer_l(conf)
+                ca = curses.color_pair(LV_BASE + 1 + LV_L.index(ol)) if ol in LV_L else (
+                    curses.color_pair(LV_BASE + 5) if ol else 0)
+                ta = curses.color_pair(LV_ODD if is_odd(term) else LV_EVEN) if term else 0
+                ea = curses.color_pair(LV_RAMP + min(9, max(0, int(10 * e / emax))))
+                a = (ca, ta, ea | (curses.A_DIM if flag else 0))
+            attr_cache[id(r)] = a
+        return a
     view = sorted(rows, key=lambda r: r[3])
     top = 0
 
@@ -911,32 +1085,53 @@ def levels_view(win, sym, stage, rows, source, err):
         uname = UNITS[st["unit"]][0]
         confw = max(10, min(60, w - 43))
 
-        win.erase()
-        put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
-        put(win, 1, 1, "%5s %-*s %-12s %-6s %14s" % ("#", confw, "configuration", "term", "J", "E / " + uname),
-            curses.A_DIM | curses.A_UNDERLINE)
-        for i in range(page):
-            k = top + i
-            if k >= n:
-                break
-            conf, term, j, e, flag = view[k]
-            line = "%5d %-*s %-12s %-6s %14s" % (k + 1, confw, conf[:confw], term[:12], j[:6],
-                                               fmt_e(e, st["unit"], flag))
-            attr = curses.A_BOLD if hit(view[k]) else 0
-            if k == st["cur"]:
-                attr = curses.A_REVERSE
-            put(win, 2 + i, 1, line, attr)
-        if n == 0:
-            msg = err or "no data"
-            width = max(10, w - 4)
-            for i in range(0, len(msg), width):
-                put(win, 3 + i // width, 2, msg[i:i + width])
-        put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
-            n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source),
-            curses.A_DIM)
-        put(win, h - 1, 1, st["msg"])
-        put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
-        win.refresh()
+        if throttle.should_draw(win):
+            win.erase()
+            put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
+            put(win, 1, 1, "%5s %-*s %-12s %-6s %14s" % ("#", confw, "configuration", "term", "J", "E / " + uname),
+                curses.A_DIM | curses.A_UNDERLINE)
+            if st["col"] and n:
+                lx = 1 + len("%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage))) + 3
+                for txt, a in ([("outer:", curses.A_DIM)] +
+                               [(l_, curses.color_pair(LV_BASE + 1 + i_)) for i_, l_ in enumerate("spdf")] +
+                               [("  parity:", curses.A_DIM), ("even", curses.color_pair(LV_EVEN)),
+                                ("odd*", curses.color_pair(LV_ODD)), ("  E:", curses.A_DIM)] +
+                               [("█", curses.color_pair(LV_RAMP + i_)) for i_ in range(10)]):
+                    put(win, 0, lx, txt, a)
+                    lx += len(txt) + (0 if txt == "█" else 1)
+            for i in range(page):
+                k = top + i
+                if k >= n:
+                    break
+                conf, term, j, e, flag = view[k]
+                cells = ["%5d " % (k + 1), "%-*s " % (confw, conf[:confw]), "%-12s " % term[:12],
+                         "%-6s " % j[:6], "%14s" % fmt_e(e, st["unit"], flag)]
+                y = 2 + i
+                if k == st["cur"] or not st["col"]:
+                    attr = curses.A_REVERSE if k == st["cur"] else (curses.A_BOLD if hit(view[k]) else 0)
+                    put(win, y, 1, "".join(cells), attr)
+                    continue
+                extra = curses.A_BOLD | curses.A_UNDERLINE if hit(view[k]) else 0
+                ra = row_attrs(view[k])
+                if ra == "limit":
+                    put(win, y, 1, "".join(cells), curses.color_pair(LV_LIMIT) | curses.A_BOLD | extra)
+                    continue
+                ca, ta, ea = ra
+                x = 1
+                for txt, a in zip(cells, (curses.A_DIM, ca, ta, 0, ea)):
+                    put(win, y, x, txt, a | extra)
+                    x += len(txt)
+            if n == 0:
+                msg = err or "no data"
+                width = max(10, w - 4)
+                for i in range(0, len(msg), width):
+                    put(win, 3 + i // width, 2, msg[i:i + width])
+            put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
+                n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source),
+                curses.A_DIM)
+            put(win, h - 1, 1, st["msg"])
+            put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
+            win.refresh()
 
         ch = win.getch()
         st["msg"] = ""
@@ -978,6 +1173,9 @@ def levels_view(win, sym, stage, rows, source, err):
             show_lines(win, "levels - keys", VHELP)
         elif c == "u":
             st["unit"] = (st["unit"] + 1) % len(UNITS)
+        elif c in ("c", "C"):
+            st["col"] = not st["col"]
+            st["msg"] = "colour " + ("on" if st["col"] else "off")
         elif c == "r":
             return "refresh"
         elif c == "o":
@@ -1028,8 +1226,10 @@ def run(win, start):
                 curses.init_pair(FILL_BASE + i + 1, curses.COLOR_WHITE if dark_bg else curses.COLOR_BLACK, C8[i])
         if big:
             init_fills()
+        init_level_pairs(big)
     except curses.error:
         pass  # monochrome terminal: attributes only
+    prune_cache()
 
     st = {"cur": 1, "matches": [], "hl": None, "msg": "", "count": "", "pend": ""}
     clicker = Clicker()
@@ -1109,8 +1309,26 @@ def run(win, start):
             if curses.COLORS >= 256:
                 init_fills()
             st["msg"] = "background=" + ("light" if OPT["light"] else "dark")
+        elif opt in ("lite", "nolite"):
+            OPT["lite"] = opt == "lite"
+            st["msg"] = "lite mode " + ("on" if OPT["lite"] else "off")
+            win.clear()
+        elif opt in ("spacing", "nospacing"):
+            OPT["space"] = opt == "spacing"
+            st["msg"] = "spacing " + ("on" if OPT["space"] else "off")
+        elif opt.startswith("aspect="):
+            try:
+                v = float(opt.split("=", 1)[1])
+            except ValueError:
+                v = 0.0
+            if not 1.0 <= v <= 3.0:
+                st["msg"] = "E474: aspect must be 1.0-3.0 (font height / width)"
+            else:
+                OPT["aspect"] = v
+                st["msg"] = "aspect %.2f" % v
         elif opt in ("opacity", "opacity?"):
-            st["msg"] = "opacity=%d  background=%s" % (OPT["opacity"], "light" if OPT["light"] else "dark")
+            st["msg"] = "opacity=%d  background=%s  aspect=%.2f  %sspacing" % (
+                OPT["opacity"], "light" if OPT["light"] else "dark", OPT["aspect"], "" if OPT["space"] else "no")
         else:
             st["msg"] = "E518: Unknown option: " + opt
 
@@ -1165,10 +1383,10 @@ def run(win, start):
             st["msg"] = "E492: Not an editor command: " + cmd
         return None
 
+    throttle = Throttle()
     while True:
-
-
-        draw(win, st)
+        if throttle.should_draw(win):
+            draw(win, st)
         ch = win.getch()
         st["msg"] = ""
         if ch == curses.KEY_RESIZE:
@@ -1265,6 +1483,10 @@ def run(win, start):
             st["hl"] = 0 if st["hl"] is None else (st["hl"] + 1) % len(CATS)
         elif c == "C":
             st["hl"] = len(CATS) - 1 if st["hl"] is None else (st["hl"] - 1) % len(CATS)
+        elif c == "L":
+            OPT["lite"] = not OPT["lite"]
+            st["msg"] = "lite mode " + ("on: no cell fills, plain level lists" if OPT["lite"] else "off")
+            win.clear()
         st["cur"] = z
 
 
