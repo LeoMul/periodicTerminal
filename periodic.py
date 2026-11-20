@@ -15,6 +15,7 @@ Env:    PERIODIC_LEVELS_DIR=dir  look there first for levels_cm_<El>+<charge>.tx
 import csv
 import curses
 import io
+import math
 import os
 import re
 import sys
@@ -392,7 +393,8 @@ def _env_float(name, default, lo, hi):
 OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light(),
        "aspect": _env_float("PERIODIC_ASPECT", 2.0, 1.0, 3.0),
        "space": os.environ.get("PERIODIC_SPACING", "1") not in ("0", "off", "no"),
-       "lite": os.environ.get("PERIODIC_LITE", "0") not in ("0", "", "off", "no")}
+       "lite": os.environ.get("PERIODIC_LITE", "0") not in ("0", "", "off", "no"),
+       "cut": {"M1": 0, "E1": 3}, "m1air": False}
 
 
 def input_pending(win):
@@ -627,6 +629,11 @@ VHELP = [
     "u                  cycle units: cm-1 / eV / Ry / Eh",
     "c                  colour on / off: configuration by outer subshell (s p d f),",
     "                   term by parity (even / odd*), energy red (low) -> blue (high)",
+    "f                  cycle line tags: M1 (in-term dJ=1, empirical A) -> E1 allowed -> off",
+    "                   E1: one-electron LS-allowed lines, hydrogenic f (dn0 / Kramers, capped)",
+    "                   method tag: dn0 same-shell, kram Kramers, cap / f=1 capped, ? penetrating",
+    "F                  full list for the current mode, strongest first (Enter -> upper level)",
+    "t / a              cycle minimum A shown / air vs vacuum wavelengths",
     "o                  toggle energy-sorted / NIST order",
     "r                  refetch from NIST (skip the cache)",
     "click row / header (header cycles units), wheel scrolls",
@@ -898,6 +905,287 @@ def is_limit(conf, term):
     return term.strip().lower() == "limit" or "limit" in conf.lower()
 
 
+# ---- M1 fine-structure lines: empirical A-values
+# A_ul = 1.3 s^-1 (lambda_ul / 4 um)^-3 f(J, L, S), for lines between levels of the same
+# LS term (same configuration and term) with J_u = J_l +- 1; J below is J_u. Pure-LS estimate.
+_LETTERS = "SPDFGHIKLMNOQRTUVWXYZ"
+_TERM_LS = re.compile(r"(\d+)\s*([SPDFGHIKLMNOQRTUVWXYZ])\d*\s*[*°]?\s*$")
+
+
+def term_LS(term):
+    """'a 6D' / 'z 4F*' / '3P' -> (L, S); None for jK, jj or unparsable terms."""
+    t = term.strip()
+    if not t or "[" in t or "(" in t or "," in t:
+        return None
+    m = _TERM_LS.search(t)
+    if not m:
+        return None
+    return float(_LETTERS.index(m.group(2))), (int(m.group(1)) - 1) / 2.0
+
+
+def parse_J(j):
+    j = j.strip()
+    try:
+        if "/" in j:
+            a, b = j.split("/")
+            return int(a) / int(b)
+        return float(int(j))
+    except ValueError:
+        return None
+
+
+def m1_f(Ju, Jl, L, S):
+    """Algebraic factor f(J, L, S) with J = J_u; 0 if the line is not allowed."""
+    J = Ju
+    if abs(Ju - (Jl + 1)) < 1e-9:
+        if J <= 0:
+            return 0.0
+        v = (J * J - (L - S) ** 2) * ((L + S + 1) ** 2 - J * J) / (12 * J * (2 * J + 1))
+    elif abs(Ju - (Jl - 1)) < 1e-9:
+        v = ((J + 1) ** 2 - (L - S) ** 2) * ((L + S + 1) ** 2 - (J + 1) ** 2) / (12 * (J + 1) * (2 * J + 1))
+    else:
+        return 0.0
+    return max(0.0, v)
+
+
+def m1_A(lam_A, f):
+    """Empirical A (s^-1) for vacuum wavelength lam_A (angstrom)."""
+    return 1.3 * (lam_A / 4.0e4) ** -3 * f
+
+
+def vac_to_air(lam):
+    """Vacuum -> air wavelength (angstrom), Morton (2000); unchanged below 2000 A."""
+    if lam < 2000.0:
+        return lam
+    s2 = (1.0e4 / lam) ** 2
+    n = 1 + 8.34254e-5 + 2.406147e-2 / (130 - s2) + 1.5998e-4 / (38.9 - s2)
+    return lam / n
+
+
+def m1_lines(rows):
+    """All in-term dJ = +-1 M1 lines -> list of (A, lam_vac_A, upper, lower, Ju, Jl, f),
+    strongest first."""
+    groups = {}
+    for r in rows:
+        conf, term, j, e, flag = r
+        if is_limit(conf, term):
+            continue
+        LS, J = term_LS(term), parse_J(j)
+        if LS is None or J is None:
+            continue
+        groups.setdefault((conf.strip(), term.strip()), []).append((r, J, LS))
+    out = []
+    for members in groups.values():
+        for i in range(len(members)):
+            for k in range(i + 1, len(members)):
+                (r1, J1, (L, S)), (r2, J2, _) = members[i], members[k]
+                if abs(abs(J1 - J2) - 1) > 1e-9 or r1[3] == r2[3]:
+                    continue
+                (up, Ju), (lo, Jl) = ((r1, J1), (r2, J2)) if r1[3] > r2[3] else ((r2, J2), (r1, J1))
+                f = m1_f(Ju, Jl, L, S)
+                if f <= 0:
+                    continue
+                lam = 1.0e8 / (up[3] - lo[3])
+                out.append((m1_A(lam, f), lam, up, lo, Ju, Jl, f))
+    out.sort(key=lambda t: -t[0])
+    return out
+
+
+def fmt_J(J):
+    return ("%d" % J) if abs(J - round(J)) < 1e-9 else ("%d/2" % round(2 * J))
+
+
+def fmt_lam(lam, air):
+    if air:
+        lam = vac_to_air(lam)
+    if lam < 1.0e4:
+        return "%.2f Å" % lam
+    if lam < 1.0e8:
+        return "%.4f µm" % (lam / 1.0e4)
+    return "%.2f cm" % (lam / 1.0e8)
+
+
+def lam_attr(lam):
+    """Colour a wavelength like the photon: red ... violet across the visible."""
+    if lam > 7500:
+        return curses.color_pair(LV_RAMP) | curses.A_DIM          # infrared
+    if lam < 3800:
+        return curses.color_pair(LV_RAMP + 9) | curses.A_DIM      # ultraviolet
+    return curses.color_pair(LV_RAMP + min(9, max(0, int((7500 - lam) / 370.0))))
+
+
+def method_attr(tag):
+    """dn0/kram: hydrogenic formula used; cap/f=1: limited; '?': penetrating orbital."""
+    if "?" in tag:
+        return curses.color_pair(LV_BASE + 1)                  # red-ish: treat with care
+    if tag.startswith(("dn0", "kram")):
+        return curses.color_pair(LV_BASE + 2)                  # green
+    return curses.color_pair(LV_LIMIT)                         # yellow: capped / f = 1
+
+
+def a_attr(A, mode="M1"):
+    if A >= MODES[mode]["strong"]:
+        return curses.color_pair(LV_LIMIT) | curses.A_BOLD          # strong
+    if A >= MODES[mode]["moderate"]:
+        return curses.color_pair(LV_BASE + 2)                      # moderate
+    return curses.A_DIM                                            # weak
+
+
+# ---- E1 (allowed) lines: hydrogenic estimates of the oscillator strength
+#
+#   Candidates: parity changes, |dJ| <= 1 (no 0-0), LS-allowed when both terms are LS
+#   (dS = 0, |dL| <= 1, no S-S), and one electron jumps n_a l_a <- n_b l_b with |dl| = 1.
+#   One-electron absorption f for a -> b, with n* = zeta sqrt(Ry/(E_limit - E)), zeta = stage:
+#     dn = 0 : f0 = (dE/Ry)/3 * l_>/(2l_a+1) * sigma^2,  sigma = 3/2 (n*/zeta) sqrt(n*^2 - l_>^2)
+#     dn != 0: fK = 0.8 * 32/(3 pi sqrt3) / (n_lo^5 n_hi^3) / (1/n_lo^2 - 1/n_hi^2)^3   (Kramers,
+#              integer n from the configuration), used as f = min(fK, f0, 1)
+#     no ionization limit in the list: f = min(fK, 1) for dn != 0, f = 1 for dn = 0
+#   Then for each upper level, the array's decay is shared over the allowed lower levels of
+#   that lower configuration in proportion to (2J_l+1), and scaled by occupancy:
+#     A_line = 6.670e15 (2l_a+1)/(2l_b+1) f / lambda[A]^2 * N_b * vac_a/(2(2l_a+1)) * w_line
+#   Method tags: dn0, kram (Kramers), cap (f0 smaller than Kramers), f=1; '?' marks a d/f
+#   orbital with n*^2 <= l(l+1), where the hydrogenic picture is poor.
+RY_CM = 109737.31568
+_ORB = re.compile(r"(\d+)([spdfghik])(\d*)")
+_LL = "spdfghik"
+
+
+def conf_occ(conf):
+    """'3d6.(5D).4s' -> {(3,2): 6, (4,0): 1}  (parent terms ignored)."""
+    occ = {}
+    for n, l, q in _ORB.findall(re.sub(r"\([^)]*\)", " ", conf)):
+        k = (int(n), _LL.index(l))
+        occ[k] = occ.get(k, 0) + (int(q) if q else 1)
+    return occ
+
+
+def one_jump(o1, o2):
+    """If configurations 1 and 2 differ by one electron moving with |dl| = 1, return
+    (orbital with the extra electron in 2, orbital with the extra electron in 1), else None.
+    A closed shell written in only one of them is ignored."""
+    diff = {}
+    for k in set(o1) | set(o2):
+        a, b = o1.get(k, 0), o2.get(k, 0)
+        cap = 2 * (2 * k[1] + 1)
+        if a != b and ((a == 0 and b == cap) or (b == 0 and a == cap)):
+            continue
+        if a != b:
+            diff[k] = a - b
+    if len(diff) != 2 or sorted(diff.values()) != [-1, 1]:
+        return None
+    k1, k2 = list(diff)
+    in1, in2 = (k1, k2) if diff[k1] == 1 else (k2, k1)
+    return (in2, in1) if abs(in1[1] - in2[1]) == 1 else None
+
+
+_KRAMERS = 0.8 * 32.0 / (3 * math.pi * math.sqrt(3))
+
+
+def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta):
+    """One-electron absorption f for a -> b -> (f, method tag)."""
+    (na, la), (nb, lb) = ka, kb
+    lg = max(la, lb)
+    fK = None
+    if na != nb:
+        n_lo, n_hi = min(na, nb), max(na, nb)
+        fK = _KRAMERS / (n_lo ** 5 * n_hi ** 3) / (1.0 / n_lo ** 2 - 1.0 / n_hi ** 2) ** 3
+    if elim is None or E_up >= elim:
+        return (min(fK, 1.0), "kram" if fK < 1 else "f=1") if fK is not None else (1.0, "f=1")
+    nsa = zeta * math.sqrt(RY_CM / (elim - E_lo))
+    nsb = zeta * math.sqrt(RY_CM / (elim - E_up))
+    nbar = 0.5 * (nsa + nsb)
+    sig = 1.5 * nbar / zeta * math.sqrt(max(nbar * nbar - lg * lg, 0.25))
+    f0 = (E_up - E_lo) / RY_CM / 3.0 * lg / (2 * la + 1) * sig * sig
+    pen = any(l >= 2 and ns * ns <= l * (l + 1) for l, ns in ((la, nsa), (lb, nsb)))
+    q = "?" if pen else ""
+    if fK is None:
+        return (min(f0, 1.0), ("dn0" if f0 < 1 else "f=1") + q)
+    f = min(fK, f0, 1.0)
+    return f, ("kram" if f == fK else "cap" if f == f0 else "f=1") + q
+
+
+def e1_A(lam_A, Ju, Jl, f=1.0):
+    """Plain f -> A conversion for a single line (kept for reference)."""
+    return 6.670e15 * (2 * Jl + 1) / (2 * Ju + 1) * f / lam_A ** 2
+
+
+def e1_lines(rows, stage=1):
+    """Candidate strong E1 lines -> list of (A, lam_vac_A, upper, lower, Ju, Jl, tag),
+    strongest first."""
+    limits = [r[3] for r in rows if is_limit(r[0], r[1])]
+    elim, zeta = (min(limits) if limits else None), float(stage or 1)
+    terms = {}
+    for r in rows:
+        conf, term, j, e, flag = r
+        if is_limit(conf, term) or not conf.strip():
+            continue
+        J = parse_J(j)
+        if J is None:
+            continue
+        key = (conf.strip(), term.strip())
+        if key not in terms:
+            terms[key] = {"LS": term_LS(term), "odd": is_odd(term), "occ": conf_occ(conf), "levels": []}
+        terms[key]["levels"].append((r, J))
+    keys, jump_cache, cand = list(terms), {}, []
+    for i in range(len(keys)):
+        for k in range(i + 1, len(keys)):
+            t1, t2 = terms[keys[i]], terms[keys[k]]
+            if t1["odd"] == t2["odd"]:
+                continue
+            note = ""
+            if t1["LS"] and t2["LS"]:
+                (L1, S1), (L2, S2) = t1["LS"], t2["LS"]
+                if abs(S1 - S2) > 1e-9 or abs(L1 - L2) > 1 + 1e-9 or (L1 == 0 and L2 == 0):
+                    continue
+            else:
+                note = " jj"
+            ck = (keys[i][0], keys[k][0])
+            if ck not in jump_cache:
+                jump_cache[ck] = one_jump(t1["occ"], t2["occ"])
+            jp = jump_cache[ck]
+            if jp is None:
+                continue
+            extra_in_2, extra_in_1 = jp
+            for r1, J1 in t1["levels"]:
+                for r2, J2 in t2["levels"]:
+                    if abs(J1 - J2) > 1 + 1e-9 or (J1 == 0 and J2 == 0) or r1[3] == r2[3]:
+                        continue
+                    if r1[3] > r2[3]:     # upper in term 1: the electron sits in extra_in_1
+                        cand.append((r1, J1, t1, r2, J2, keys[k][0], extra_in_2, extra_in_1, note))
+                    else:
+                        cand.append((r2, J2, t2, r1, J1, keys[i][0], extra_in_1, extra_in_2, note))
+    # (2J_l+1) sharing: per upper level and lower configuration
+    wsum = {}
+    for up, Ju, tu, lo, Jl, lconf, ka, kb, note in cand:
+        key = (id(up), lconf)
+        wsum[key] = wsum.get(key, 0.0) + 2 * Jl + 1
+    out = []
+    for up, Ju, tu, lo, Jl, lconf, ka, kb, note in cand:
+        f, tag = f_hydrogenic(ka, kb, lo[3], up[3], elim, zeta)
+        cap_a = 2 * (2 * ka[1] + 1)
+        occ = tu["occ"].get(kb, 1) * max(0, cap_a - tu["occ"].get(ka, 0)) / cap_a
+        if occ <= 0 or f <= 0:
+            continue
+        w = (2 * Jl + 1) / wsum[(id(up), lconf)]
+        lam = 1.0e8 / (up[3] - lo[3])
+        A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * w
+        out.append((A, lam, up, lo, Ju, Jl, tag + note))
+    out.sort(key=lambda t: -t[0])
+    return out
+
+
+MODES = {
+    "M1": {"cuts": [0.0, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0], "strong": 1.0, "moderate": 1e-2,
+           "title": "M1 lines within LS terms (dJ = ±1)",
+           "formula": "A = 1.3 s⁻¹ (λ/4 µm)⁻³ f(J,L,S)   empirical, pure-LS estimate"},
+    "E1": {"cuts": [0.0, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9], "strong": 1e8, "moderate": 1e6,
+           "title": "LS-allowed E1 lines (one-electron jumps)",
+           "formula": "hydrogenic f (dn0: same-shell formula, kram: Kramers, capped), "
+                      "shared by (2J_l+1), x occupancy; ? = penetrating d/f orbital"},
+}
+A_CUTS = MODES["M1"]["cuts"]
+
+
 def fmt_e(e, unit_i, flag):
     s = ("%.3f" if unit_i == 0 else "%.6f") % (e * UNITS[unit_i][1])
     return "[" + s + "]" if flag == "[" else "(" + s + ")" if flag == "(" else s
@@ -1037,7 +1325,24 @@ def stage_picker(win, z):
 def levels_view(win, sym, stage, rows, source, err):
     """Scrollable level table. -> 'close', 'quit' or 'refresh'."""
     st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": "",
-          "col": not OPT["lite"]}
+          "col": not OPT["lite"], "mode": None}
+    linecache, upcache = {}, {}
+
+    def lines_all(mode):
+        if mode not in linecache:
+            linecache[mode] = m1_lines(rows) if mode == "M1" else e1_lines(rows, stage)
+        return linecache[mode]
+
+    def by_upper(mode):
+        """id(upper level) -> lines from it above the A cut, strongest first."""
+        key = (mode, OPT["cut"][mode])
+        if key not in upcache:
+            d, cut = {}, MODES[mode]["cuts"][OPT["cut"][mode]]
+            for t in lines_all(mode):
+                if t[0] >= cut:
+                    d.setdefault(id(t[2]), []).append(t)
+            upcache[key] = d
+        return upcache[key]
     throttle = Throttle()
     emax = max((r[3] for r in rows), default=0.0) or 1.0
     attr_cache = {}
@@ -1083,13 +1388,23 @@ def levels_view(win, sym, stage, rows, source, err):
         if st["cur"] >= top + page:
             top = st["cur"] - page + 1
         uname = UNITS[st["unit"]][0]
-        confw = max(10, min(60, w - 43))
+        mode = st["mode"]
+        annw = (45 if mode == "E1" else 34) if mode else 0
+        narrow = bool(mode) and w < 43 + annw + 12          # tags on, little room: hide the configuration
+        termw, ew = (9, 12) if narrow else (12, 14)
+        confw = 0 if narrow else max(10, min(60, w - 43 - annw))
+        m1map = by_upper(mode) if mode else {}
+        vidx = {id(r_): i_ for i_, r_ in enumerate(view)} if mode == "E1" else {}
 
         if throttle.should_draw(win):
             win.erase()
             put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
-            put(win, 1, 1, "%5s %-*s %-12s %-6s %14s" % ("#", confw, "configuration", "term", "J", "E / " + uname),
-                curses.A_DIM | curses.A_UNDERLINE)
+            put(win, 1, 1, "%5s %s%-*s %-6s %*s" % ("#", ("%-*s " % (confw, "configuration")) if confw else "",
+                                                    termw, "term", "J", ew, "E / " + uname)
+                + ("  %-40s" % ("%s →%s  λ_%s  A/s⁻¹" % (
+                    mode, "J_l" if mode == "M1" else "#lev", "air" if OPT["m1air"] else "vac")
+                    + ("  method" if mode == "E1" else ""))
+                   if mode else ""), curses.A_DIM | curses.A_UNDERLINE)
             if st["col"] and n:
                 lx = 1 + len("%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage))) + 3
                 for txt, a in ([("outer:", curses.A_DIM)] +
@@ -1104,9 +1419,23 @@ def levels_view(win, sym, stage, rows, source, err):
                 if k >= n:
                     break
                 conf, term, j, e, flag = view[k]
-                cells = ["%5d " % (k + 1), "%-*s " % (confw, conf[:confw]), "%-12s " % term[:12],
-                         "%-6s " % j[:6], "%14s" % fmt_e(e, st["unit"], flag)]
+                cells = ["%5d " % (k + 1), ("%-*s " % (confw, conf[:confw])) if confw else "",
+                         "%-*s " % (termw, term[:termw]), "%-6s " % j[:6], "%*s" % (ew, fmt_e(e, st["unit"], flag))]
                 y = 2 + i
+                lines_here = m1map.get(id(view[k])) if mode else None
+                if lines_here:
+                    A_, lam_, _, lo_, _, Jl_, _ = lines_here[0]
+                    ax = 1 + len("".join(cells)) + 2
+                    more = " +%d" % (len(lines_here) - 1) if len(lines_here) > 1 else ""
+                    on = k == st["cur"]
+                    tgt = fmt_J(Jl_) if mode == "M1" else "#%d" % (vidx.get(id(lo_), -1) + 1)
+                    put(win, y, ax, "→%-5s" % tgt, curses.A_REVERSE if on else curses.A_BOLD)
+                    put(win, y, ax + 7, "%-13s" % fmt_lam(lam_, OPT["m1air"]),
+                        curses.A_REVERSE if on else lam_attr(lam_))
+                    put(win, y, ax + 21, "%-9.3g" % A_, curses.A_REVERSE if on else a_attr(A_, mode))
+                    tail = (" %-7s" % lines_here[0][6] if mode == "E1" else "") + more
+                    put(win, y, ax + 30, tail, curses.A_REVERSE if on else
+                        (method_attr(lines_here[0][6]) if mode == "E1" else 0))
                 if k == st["cur"] or not st["col"]:
                     attr = curses.A_REVERSE if k == st["cur"] else (curses.A_BOLD if hit(view[k]) else 0)
                     put(win, y, 1, "".join(cells), attr)
@@ -1127,7 +1456,10 @@ def levels_view(win, sym, stage, rows, source, err):
                 for i in range(0, len(msg), width):
                     put(win, 3 + i // width, 2, msg[i:i + width])
             put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
-                n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source),
+                n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source)
+                + ("   %s: %d lines, A ≥ %g  (f next  F list  t cut  a air/vac)" % (
+                    mode, sum(len(v) for v in m1map.values()), MODES[mode]["cuts"][OPT["cut"][mode]])
+                   if mode else ""),
                 curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
             put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
@@ -1176,6 +1508,32 @@ def levels_view(win, sym, stage, rows, source, err):
         elif c in ("c", "C"):
             st["col"] = not st["col"]
             st["msg"] = "colour " + ("on" if st["col"] else "off")
+        elif c == "f":
+            st["mode"] = {None: "M1", "M1": "E1", "E1": None}[st["mode"]]
+            if st["mode"] == "M1":
+                nl = len(lines_all("M1"))
+                st["msg"] = ("M1: %d in-term lines (empirical A, pure LS)  f again: allowed lines" % nl) if nl \
+                    else "M1: no same-term levels with dJ = 1 and parsable LS terms  (f again: allowed lines)"
+            elif st["mode"] == "E1":
+                nl = len(lines_all("E1"))
+                st["msg"] = "E1: %d candidate allowed lines, hydrogenic f estimates  F list  t cut" % nl
+            else:
+                st["msg"] = "line tags off"
+        elif c == "F":
+            res = lines_view(win, sym, stage, lines_all(st["mode"] or "M1"), st["mode"] or "M1")
+            if res == "quit":
+                return "quit"
+            if isinstance(res, tuple) and res[1] in view:
+                st["cur"] = view.index(res[1])
+                st["mode"] = res[2]
+            win.clear()
+        elif c == "t" and st["mode"]:
+            md = st["mode"]
+            OPT["cut"][md] = (OPT["cut"][md] + 1) % len(MODES[md]["cuts"])
+            st["msg"] = "%s lines shown with A ≥ %g s^-1" % (md, MODES[md]["cuts"][OPT["cut"][md]])
+        elif c == "a" and st["mode"]:
+            OPT["m1air"] = not OPT["m1air"]
+            st["msg"] = "wavelengths: " + ("air (above 2000 Å)" if OPT["m1air"] else "vacuum")
         elif c == "r":
             return "refresh"
         elif c == "o":
@@ -1193,6 +1551,144 @@ def levels_view(win, sym, stage, rows, source, err):
         elif c in ("n", "N") and st["q"]:
             if not jump(1 if c == "n" else -1):
                 st["msg"] = "pattern not found"
+        elif c == ":":
+            q = prompt(win, ":")
+            if q is None:
+                continue
+            word = q.strip()
+            if word in CLOSE:
+                return "close"
+            if word in QUIT_ALL:
+                return "quit"
+            if word.isdigit():
+                st["cur"] = max(0, min(n - 1, int(word) - 1))
+            elif word:
+                st["msg"] = "E492: Not an editor command: " + word
+
+
+def lines_view(win, sym, stage, lines, mode):
+    """Full line list, strongest first. -> 'close', 'quit' or ('goto', upper, mode)."""
+    st = {"cur": 0, "count": "", "pend": "", "msg": "", "bylam": False}
+    throttle = Throttle()
+    top = 0
+    M = MODES[mode]
+
+    def visible():
+        cut = M["cuts"][OPT["cut"][mode]]
+        v_ = [t for t in lines if t[0] >= cut]
+        return sorted(v_, key=lambda t: t[1]) if st["bylam"] else v_
+
+    v = visible()
+    while True:
+        h, w = win.getmaxyx()
+        page = max(1, h - 5)
+        n = len(v)
+        st["cur"] = max(0, min(st["cur"], n - 1)) if n else 0
+        if st["cur"] < top:
+            top = st["cur"]
+        if st["cur"] >= top + page:
+            top = st["cur"] - page + 1
+        lamh = "λ_" + ("air" if OPT["m1air"] else "vac")
+        if throttle.should_draw(win):
+            win.erase()
+            put(win, 0, 1, "%s %s  %s" % (sym, roman(stage), M["title"]), curses.A_BOLD)
+            put(win, 1, 1, M["formula"] + ";  Enter jumps to the upper level", curses.A_DIM)
+            if mode == "M1":
+                confw = max(8, min(40, w - 93))
+                put(win, 2, 1, "%4s %-*s %-10s %-11s %12s %12s  %-14s %10s %6s" % (
+                    "#", confw, "configuration", "term", "J_u → J_l", "E_u/cm⁻¹",
+                    "E_l/cm⁻¹", lamh, "A/s⁻¹", "f"), curses.A_DIM | curses.A_UNDERLINE)
+            else:
+                confw = max(0, min(30, (w - 76) // 2))
+                put(win, 2, 1, ("%4s %-8s %-5s   %-8s %-5s %-14s %10s %-7s" % (
+                    "#", "upper", "J", "lower", "J", lamh, "A/s⁻¹", "method"))
+                    + ((" %-*s %-*s" % (confw, "upper conf", confw, "lower conf")) if confw >= 6 else ""),
+                    curses.A_DIM | curses.A_UNDERLINE)
+            for i in range(page):
+                k = top + i
+                if k >= n:
+                    break
+                A, lam, up, lo, Ju, Jl, extra = v[k]
+                y, on = 3 + i, k == st["cur"]
+                if mode == "M1":
+                    cells = [("%4d " % (k + 1), curses.A_DIM), ("%-*s " % (confw, up[0][:confw]), 0),
+                             ("%-10s " % up[1][:10], 0), ("%-11s " % ("%s → %s" % (fmt_J(Ju), fmt_J(Jl))), 0),
+                             ("%12s " % fmt_e(up[3], 0, up[4]), 0), ("%12s  " % fmt_e(lo[3], 0, lo[4]), 0),
+                             ("%-14s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
+                             ("%10.3g " % A, a_attr(A, mode)), ("%6.3f" % extra, curses.A_DIM)]
+                else:
+                    cells = [("%4d " % (k + 1), curses.A_DIM),
+                             ("%-8s " % up[1][:8], 0), ("%-5s → " % fmt_J(Ju), 0),
+                             ("%-8s " % lo[1][:8], 0), ("%-5s " % fmt_J(Jl), 0),
+                             ("%-14s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
+                             ("%10.3g " % A, a_attr(A, mode)), ("%-7s " % extra, method_attr(extra))]
+                    if confw >= 6:
+                        cells += [("%-*s " % (confw, up[0][:confw]), curses.A_DIM),
+                                  ("%-*s" % (confw, lo[0][:confw]), curses.A_DIM)]
+                x = 1
+                for txt, a in cells:
+                    put(win, y, x, txt, curses.A_REVERSE if on else a)
+                    x += len(txt)
+            if n == 0:
+                cut = M["cuts"][OPT["cut"][mode]]
+                why = (" above A = %g s^-1 (t to change)" % cut) if cut else (
+                    ": needs two levels of the same configuration and LS term with J differing by 1"
+                    if mode == "M1" else
+                    ": needs opposite-parity terms whose configurations differ by one electron")
+                put(win, 4, 2, "no %s lines%s" % (mode, why))
+            put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s   t cut  s sort  a air/vac  "
+                "Enter goto  q back" % (n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]],
+                                         "λ" if st["bylam"] else "A")
+                + ("   method: dn0 same-shell, kram Kramers, cap/f=1 capped, ? penetrating"
+                   if mode == "E1" else ""), curses.A_DIM)
+            put(win, h - 1, 1, st["msg"])
+            put(win, h - 1, w - 10, st["count"] + st["pend"], curses.A_BOLD)
+            win.refresh()
+
+        ch = win.getch()
+        st["msg"] = ""
+        if ch == curses.KEY_RESIZE:
+            win.clear()
+            continue
+        if ch == curses.KEY_MOUSE:
+            ev = read_mouse()
+            if ev and n:
+                kind, mx, my = ev
+                if kind == "up":
+                    st["cur"] = max(0, st["cur"] - 3)
+                elif kind == "down":
+                    st["cur"] = min(n - 1, st["cur"] + 3)
+                elif 0 <= my - 3 < page and top + my - 3 < n:
+                    st["cur"] = top + my - 3
+            continue
+        c = chr(ch) if 0 <= ch < 256 else ""
+        if st["pend"] == "Z":
+            st["pend"] = ""
+            if c in ("Z", "Q"):
+                return "close"
+            continue
+        if ch == 27:
+            if st["count"] or st["pend"]:
+                st["count"] = st["pend"] = ""
+                continue
+            return "close"
+        if ch in (10, 13, curses.KEY_ENTER) and n:
+            return ("goto", v[st["cur"]][2], mode)
+        if list_nav(st, ch, c, n, page):
+            continue
+        st["count"] = ""
+        if c in ("q", "F", "f"):
+            return "close"
+        elif c == "Z":
+            st["pend"] = "Z"
+        elif c == "t":
+            OPT["cut"][mode] = (OPT["cut"][mode] + 1) % len(M["cuts"])
+            v = visible()
+        elif c == "s":
+            st["bylam"] = not st["bylam"]
+            v = visible()
+        elif c == "a":
+            OPT["m1air"] = not OPT["m1air"]
         elif c == ":":
             q = prompt(win, ":")
             if q is None:
