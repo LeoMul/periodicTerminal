@@ -10,7 +10,7 @@ This is completely vibecoded. By design, I have not looked at any of the code by
 - **Scales to the terminal.** Cells stay visually square as the window grows (1×2 up to 5×10 characters, showing Z, symbol, name and mass as space allows), with equal visual gaps between periods and groups.
 - **Vim-style navigation and command mode**: `hjkl` / arrow keys, `w`/`b`, `0`/`$`/`gg`/`G` (with counts), `/` search with `n`/`N`, `c`/`C` category highlighting, and `:` Ex commands (`:q`, `:wq`, `:qa`, `ZZ` all work).
 - **NIST ASD energy levels**: press `Enter` (or double-click / right-click) on an element, pick an ionization stage, and the levels are fetched from NIST, cached locally, or read from your own pre-downloaded files. Units `cm⁻¹`, `eV`, `Ry`, `Eh`; energy or NIST ordering; colour-coded output.
-- **Line estimates** in the level viewer (`f` / `F`): M1 fine-structure lines with an empirical A-value, and candidate allowed (E1) lines with a hydrogenic A-value estimate.
+- **Line estimates and NIST transition probabilities** in the level viewer (`f` / `F`): M1 fine-structure lines with an empirical A-value, candidate allowed (E1) lines with a hydrogenic A-value estimate, and NIST ASD A-values shown alongside them wherever NIST has the line.
 - **Mouse support**, cell opacity and light/dark blending, and a **lite mode** for slow terminals.
 
 ## Requirements
@@ -89,11 +89,12 @@ Lists every ionization stage with its charge, electron count and isoelectronic s
 | `u` | Cycle units: `cm⁻¹`, `eV`, `Ry`, `Eh` |
 | `o` | Toggle sorting by energy vs. NIST order |
 | `c` | Colour coding on / off (see below) |
-| `f` | Cycle line tags: M1 → E1 → off |
+| `f` | Cycle line tags: M1 → E1 → NIST → off |
 | `F` | Full line list for the current mode (M1 if tags are off) |
+| `s` (in the `F` list) | Cycle sort: A, wavelength, worst estimate-vs-NIST agreement first |
 | `t` | Cycle the minimum A-value shown |
 | `a` | Vacuum / air wavelengths |
-| `r` | Refetch from NIST ASD, bypassing the cache |
+| `r` | Refetch the levels from NIST ASD, bypassing the cache (the lines are refetched on the next visit to the NIST state) |
 | `q`, `Esc`, `:q`, `ZZ` | Back to the picker / table (`:qa` quits the app) |
 
 **Colour coding.** Configuration is coloured by its outermost written subshell (s, p, d, f). The term is coloured by parity (even, or odd, marked `*` by NIST). Energy runs from red (low) to blue (high), like photon colour. The ionization limit is shown in yellow, and derived or uncertain levels (`[ ]`, `( )`) are dimmed.
@@ -162,9 +163,19 @@ This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier io
 - alkali principal-series lines beyond the first, such as Na 3303 Å (4p → 3s): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
 - lines from a singlet upper level of ns np → ns², such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
 
+### NIST transition probabilities
+
+NIST is only queried when you select the NIST state (`f` three times). That makes one request per ion for NIST ASD's lines with transition probabilities (allowed and forbidden), cached like the levels. `PERIODIC_LINES_DIR` is checked first for files named `lines_<El>+<charge>.txt`. The M1 and E1 states never touch the network, but they do use NIST values that are already on disk, from `PERIODIC_LINES_DIR` or the cache of an earlier NIST query. After `r`, the next visit to the NIST state refetches the lines. Each NIST line is matched to the level list by upper and lower energy and J, to within about 0.05 cm⁻¹; configuration and term strings aren't relied on.
+
+- **Which value is shown.** Where NIST has a line, its A-value is displayed (and used for cuts, sorting and "strongest line"), tagged with its accuracy grade, e.g. `N:B+`. Our estimate is shown next to it. Where NIST has no value, the estimate is shown as before.
+- **NIST-only lines.** Lines our selection rules don't produce, such as intercombination, two-electron and E2/M2 lines, appear in the M1, E1 and NIST lists with an empty estimate column. NIST's `Type` column decides whether a line belongs to the M1 or the E1 view.
+- **The NIST state** (`f` three times) lists every NIST line with an A-value, with our estimate attached where it exists.
+- **The `F` list** shows `A_NIST`, the grade, `A_est` and `est/N` side by side. Ratios outside 1/3–3 are highlighted, and the status line gives the median est/NIST ratio for the ion. Sorting by worst agreement (`s` twice) brings the lines where the estimate fails most to the top.
+- **Without NIST data** (not queried yet, or unreachable), the estimates are shown on their own, and the status line says which.
+
 ### Where the tags appear
 
-- **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1), then λ, A and, for E1, the method tag. `+N` means N more lines. In narrow windows the configuration column is hidden to make room.
+- **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1, NIST), then λ and A. Next comes the source: `N:<grade>` for a NIST value, followed by our estimate as `est …` when we have one, or the E1 method tag / `est` for an estimate alone. `+N` means N more lines. In narrow windows the configuration column is hidden to make room, and the `est …` part may be cut off; the `F` list always shows both values.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
 - **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`.
 - **Air wavelengths** (`a`) use the refractive-index formula of [Morton (2000), ApJS 130, 403](https://doi.org/10.1086/317349) above 2000 Å.
@@ -174,6 +185,7 @@ This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier io
 | Variable | Effect |
 | --- | --- |
 | `PERIODIC_LEVELS_DIR` | Directory checked first for pre-downloaded NIST files named `levels_cm_<El>+<charge>.txt`, e.g. `levels_cm_Fe+0.txt` for Fe I |
+| `PERIODIC_LINES_DIR` | Directory checked first for pre-downloaded NIST lines files named `lines_<El>+<charge>.txt`, e.g. `lines_Fe+1.txt` for Fe II |
 | `PERIODIC_OPACITY` | Initial cell opacity, `10`–`100` (default `70`) |
 | `PERIODIC_ASPECT` | Font height:width ratio for square cells, `1.0`–`3.0` (default `2.0`) |
 | `PERIODIC_SPACING` | Set to `0` to start with no gaps between cells |
@@ -182,7 +194,7 @@ This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier io
 | `PERIODIC_CACHE_MB` | Size cap for the cache directory (default `500`) |
 | `COLORFGBG` | If your terminal sets it, used to detect a light background |
 
-**Cache.** `~/.cache/periodic/` stores fetched NIST responses. If a reply can't be parsed, the full reply is saved to `last_reply.txt` there. The directory is kept under `PERIODIC_CACHE_MB`: the files with the oldest timestamps are removed first, and reading a cached file refreshes its timestamp, so recently used files survive. `PERIODIC_LEVELS_DIR` is never touched.
+**Cache.** `~/.cache/periodic/` stores fetched NIST responses, both levels and lines. If a reply can't be parsed, the full reply is saved to `last_reply.txt` there. The directory is kept under `PERIODIC_CACHE_MB`: the files with the oldest timestamps are removed first, and reading a cached file refreshes its timestamp, so recently used files survive. `PERIODIC_LEVELS_DIR` is never touched.
 
 ## Performance
 
