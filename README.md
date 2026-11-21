@@ -112,23 +112,29 @@ These are quick, order-of-magnitude guides for spotting potentially important li
 
 These are lines between levels of the same configuration and LS term with $\Delta J = \pm 1$. They use the empirical formula
 
-$$
+```math
 A_{ul} = 1.3\ \mathrm{s^{-1}} \left( \frac{\lambda_{ul}}{4\ \mu\mathrm{m}} \right)^{-3} f(J, L, S),
-$$
+```
 
 where $J = J_u$ and
 
-$$
+```math
 f(J, L, S) =
 \begin{cases}
 \dfrac{\left(J^2 - (L-S)^2\right)\left((L+S+1)^2 - J^2\right)}{12\,J\,(2J+1)}, & J_u = J_l + 1, \\[2ex]
 \dfrac{\left((J+1)^2 - (L-S)^2\right)\left((L+S+1)^2 - (J+1)^2\right)}{12\,(J+1)(2J+1)}, & J_u = J_l - 1.
 \end{cases}
-$$
+```
 
 This is a pure-LS estimate, so expect it to degrade for heavy or highly charged ions. As spot checks, it gives about $62\ \mathrm{s^{-1}}$ for the Fe XIV 5303 Å coronal line, $1.0\times10^{-4}$ and $2.7\times10^{-5}\ \mathrm{s^{-1}}$ for [O III] 52 and 88 µm, and $2.2\times10^{-3}\ \mathrm{s^{-1}}$ for [Fe II] 26 µm.
 
-> **TODO:** add the reference for the empirical M1 formula above.
+The factor $f(J, L, S)$ is the M1 line strength for transitions within an LS term, divided by the upper-level degeneracy, following [Pasternack (1940), ApJ 92, 129](https://ui.adsabs.harvard.edu/abs/1940ApJ....92..129P), [Shortley (1940), Phys. Rev. 57, 225](https://doi.org/10.1103/PhysRev.57.225) and [Bahcall & Wolf (1968), ApJ 152, 701](https://ui.adsabs.harvard.edu/abs/1968ApJ...152..701B). The prefactor comes from the standard M1 conversion
+
+```math
+A_{ul} = \frac{2.6973\times10^{13}}{\lambda^3}\,\frac{S}{2J_u+1}\ \mathrm{s^{-1}}, \qquad \lambda \text{ in Å},\ S \text{ in } \mu_B^2,
+```
+
+which at $\lambda = 4\ \mu\mathrm{m}$, with $S/(2J_u+1) = 3f$, gives $1.26 \approx 1.3\ \mathrm{s^{-1}}$.
 
 ### E1 (allowed) lines (`f` twice)
 
@@ -140,55 +146,55 @@ This is a pure-LS estimate, so expect it to degrade for heavy or highly charged 
 
 **A-value.** The A-value is converted from an oscillator strength with the standard relation, as given in the [NIST Atomic Spectroscopy compendium](https://www.nist.gov/pml/atomic-spectroscopy-compendium-basic-ideas-notation-data-and-formulas/atomic-spectroscopy):
 
-$$
+```math
 A_{ki} = \frac{6.670\times10^{15}}{\lambda^2}\,\frac{g_i}{g_k}\,f_{ik}\ \mathrm{s^{-1}}, \qquad \lambda \text{ in Å}.
-$$
+```
 
 The one-electron oscillator strength is estimated hydrogenically, using effective quantum numbers taken from the ionization limit in the level list:
 
-$$
+```math
 n^* = \zeta \sqrt{\frac{\mathrm{Ry}}{E_\text{limit} - E}}, \qquad \zeta = \text{ion stage}.
-$$
+```
 
 | Case | Oscillator strength | Tag |
 | --- | --- | --- |
-| Same shell ($\Delta n = 0$) | $f_0 = \dfrac{\Delta E}{3\,\mathrm{Ry}} \cdot \dfrac{l_>}{2l_a+1}\,\sigma^2$, with $\sigma = \dfrac{3}{2}\,\dfrac{\bar n^*}{\zeta}\sqrt{\bar n^{*2} - l_>^2}$ | `dn0` |
-| $\Delta n \ne 0$ | Exact hydrogenic $f_H(n_a l_a \to n_b l_b)$ with the integer $n$ of the configuration, blended with $f_0$ by how much of the integer $\Delta n$ survives in the effective quantum numbers: $f = f_0^{\,1-x} f_H^{\,x}$, with $x = \Delta n^* / \Delta n$ clipped to $[0, 1]$. Large quantum defects shrink $\Delta n^*$, and the line then behaves more like a same-shell line | `hyd` ($x > 0.9$), `mix` |
+| Same shell ($\Delta n = 0$) | $f_0 = \dfrac{\Delta E}{3\ \mathrm{Ry}} \cdot \dfrac{l_>}{2l_a+1}\ \sigma^2$, with $\sigma = \dfrac{3}{2}\ \dfrac{\bar n^{\ast}}{\zeta}\sqrt{\bar n^{\ast 2} - l_>^2}$ | `dn0` |
+| $\Delta n \ne 0$ | Exact hydrogenic $f_H(n_a l_a \to n_b l_b)$ with the integer $n$ of the configuration, blended with $f_0$ by how much of the integer $\Delta n$ survives in the effective quantum numbers: $f = f_0^{1-x} f_H^{x}$, with $x = \Delta n^{\ast} / \Delta n$ clipped to $[0, 1]$. Large quantum defects shrink $\Delta n^{\ast}$, and the line then behaves more like a same-shell line | `hyd` ($x > 0.9$), `mix` |
 | No ionization limit in the list | $f = f_H$ for $\Delta n \ne 0$, otherwise $1$ | `hyd`, `f=1` |
 | Any of the above reaching $f \ge 1$ | capped at $1$ | `f=1` |
 
 The result is then scaled by the occupancy factor
 
-$$
+```math
 N_b \times \frac{\text{vacancies in } n_a l_a}{2(2l_a+1)},
-$$
+```
 
 and split among the lower levels with LS recoupling (Wigner 6j) factors. Each factor sums to 1, so an upper level's total decay rate is unchanged and only its distribution between lines is affected:
 
 - **J branching** within a multiplet, whenever both terms are LS, normalised over $J_l$:
 
-$$
+```math
 F_J = (2J_l+1)\begin{Bmatrix} L_u & J_u & S \\ J_l & L_l & 1 \end{Bmatrix}^2
-$$
+```
 
 - **Term branching** when both configurations show the same parent term $L_c$ (e.g. `3d6.(5D).4p` → `3d6.(5D).4s`), or the core is closed, normalised over the lower terms the parent allows:
 
-$$
+```math
 F_\text{term} = (2L_l+1)\begin{Bmatrix} l_b & L_u & L_c \\ L_l & l_a & 1 \end{Bmatrix}^2
-$$
+```
 
 - **No stated parent** (e.g. `4s2.4p2`, `3d7`): the lower terms present share by $(2L_l+1)(2S+1)$, and the line is tagged `~`.
 - **Any non-LS term** in the group: fallback to $(2J_l+1)$ sharing.
 
 The 6j symbols use Racah's formula and are cached, so this costs almost nothing.
 
-A `?` after the tag marks a d or f orbital with $n^{*2} \le l(l+1)$, where the hydrogenic picture is poor; a `~` marks a line whose lower-term split had no parent to go on.
+A `?` after the tag marks a d or f orbital with $n^{\ast 2} \le l(l+1)$, where the hydrogenic picture is poor; a `~` marks a line whose lower-term split had no parent to go on.
 
-**Inner-subshell jumps (`ci`).** These are lines of the type $ns\,np^{k+1} \to ns^2\,np^k$, such as C II $2s2p^2 \to 2s^2 2p$ or Se III $4s4p^3 \to 4s^2 4p^2$. Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
+**Inner-subshell jumps (`ci`).** These are lines of the type $ns\ np^{k+1} \to ns^2\ np^k$, such as C II $2s2p^2 \to 2s^2 2p$ or Se III $4s4p^3 \to 4s^2 4p^2$. Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
 - the p electron uses the valence binding of the lower level, $E_\text{limit} - E_\text{lower}$
 - the s electron is bound more deeply by the excitation energy, $E_\text{limit} - E_\text{lower} + \Delta E$
 
-This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\times10^{8}$). In heavier ions, though, $ns\,np^{k+1}$ mixes strongly with $ns^2\,np^{k-1}\,nd$, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III $4s4p^3 \to 4s^2 4p^2$, the estimate is about $8\times10^{8}\ \mathrm{s^{-1}}$, against about $5\times10^{7}$ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
+This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\times10^{8}$). In heavier ions, though, $ns\ np^{k+1}$ mixes strongly with $ns^2\ np^{k-1}\ nd$, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III $4s4p^3 \to 4s^2 4p^2$, the estimate is about $8\times10^{8}\ \mathrm{s^{-1}}$, against about $5\times10^{7}$ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
 
 **Typical accuracy** against reference values:
 - Lyα and Hα: exact
@@ -199,7 +205,7 @@ This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\time
 **Known failures:**
 - `ci` lines (above): can be ~10× too high
 - alkali principal-series lines beyond the first, such as Na 3303 Å ($4p \to 3s$): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
-- lines from a singlet upper level of $ns\,np \to ns^2$, such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
+- lines from a singlet upper level of $ns\ np \to ns^2$, such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
 
 ### NIST transition probabilities
 
