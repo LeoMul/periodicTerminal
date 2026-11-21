@@ -1,4 +1,4 @@
-# pt-term
+# periodicTerminal
 
 A vim-inspired periodic table and [NIST Atomic Spectra Database (ASD)](https://physics.nist.gov/PhysRefData/ASD/levels_form.html) energy-level viewer for your terminal, built with Python [`curses`](https://docs.python.org/3/library/curses.html).
 
