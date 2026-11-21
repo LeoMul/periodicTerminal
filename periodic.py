@@ -632,16 +632,17 @@ VHELP = [
     "c                  colour on / off: configuration by outer subshell (s p d f),",
     "                   term by parity (even / odd*), energy red (low) -> blue (high)",
     "f                  cycle line tags: M1 (in-term dJ=1, empirical A) -> E1 allowed ->",
-    "                   NIST (all lines with A in NIST ASD) -> off.  Only the NIST state",
-    "                   queries NIST; M1/E1 use NIST values already on disk.  Tags show",
-    "                   NIST's A and grade (N:B+) where known, with our estimate after it",
+    "                   NIST -> off.  M1 and E1 show our estimates only; the NIST state",
+    "                   queries NIST and shows its A and grade (N:B+) with our estimate.",
+    "                   +N = N more lines from that level in the current list (and cut);",
+    "                   A-values in s^-1, wavelengths vacuum unless a toggles air",
     "                   E1: one-electron LS-allowed lines, hydrogenic f estimates",
     "                   method tag: dn0 same-shell, hyd exact hydrogenic, mix blend of the two,",
     "                   f=1 capped, ? penetrating d/f orbital; strength split by LS 6j,",
     "                   ~ = no stated parent, so lower terms share by (2L+1)(2S+1)",
     "                   ci: ns np^(k+1) -> ns2 np^k type, often much weaker (configuration mixing)",
-    "F                  full list for the current mode: A_NIST, grade, A_est, est/NIST side by side",
-    "                   s cycles sort: A / wavelength / worst est-vs-NIST agreement first",
+    "F                  full list for the current mode (NIST: A_NIST, grade, A_est, est/NIST)",
+    "                   s cycles sort: A / wavelength (/ worst est-vs-NIST agreement first)",
     "t / a              cycle minimum A shown / air vs vacuum wavelengths",
     "o                  toggle energy-sorted / NIST order",
     "r                  refetch levels and lines from NIST (skip the cache)",
@@ -865,11 +866,14 @@ def get_levels(sym, stage, force=False):
 
 # ---- colour coding for the level table
 LV_BASE = 40                       # pairs 41.. : subshell l, parity, limit, energy ramp
-LV_L = "spdfg"                     # outermost subshell -> pairs 41..45
 LV_EVEN, LV_ODD, LV_LIMIT = 46, 47, 48
 LV_RAMP = 50                       # pairs 50..59: energy, low (red) -> high (blue), like photon colour
+SHELLS = "spdfghik"                # outermost subshell -> pairs 61..68, one colour each
+LV_SHELL = 60
 LV256 = {"l": [203, 114, 75, 177, 215], "even": 117, "odd": 216, "limit": 226,
-         "ramp": [196, 208, 214, 220, 154, 84, 49, 44, 39, 33]}
+         "ramp": [196, 208, 214, 220, 154, 84, 49, 44, 39, 33],
+         #         s    p    d   f    g    h   i    k
+         "shell": [203, 114, 75, 177, 215, 87, 228, 252]}
 
 
 def init_level_pairs(big):
@@ -882,6 +886,8 @@ def init_level_pairs(big):
             curses.init_pair(LV_LIMIT, LV256["limit"], -1)
             for i, c in enumerate(LV256["ramp"]):
                 curses.init_pair(LV_RAMP + i, c, -1)
+            for i, c in enumerate(LV256["shell"]):
+                curses.init_pair(LV_SHELL + 1 + i, c, -1)
         else:
             C = curses
             for i, c in enumerate((C.COLOR_RED, C.COLOR_GREEN, C.COLOR_BLUE, C.COLOR_MAGENTA, C.COLOR_YELLOW)):
@@ -893,6 +899,9 @@ def init_level_pairs(big):
                    (C.COLOR_CYAN,) * 2 + (C.COLOR_BLUE,) * 2
             for i, c in enumerate(ramp):
                 curses.init_pair(LV_RAMP + i, c, -1)
+            for i, c in enumerate((C.COLOR_RED, C.COLOR_GREEN, C.COLOR_BLUE, C.COLOR_MAGENTA,
+                                   C.COLOR_YELLOW, C.COLOR_CYAN, C.COLOR_WHITE, C.COLOR_WHITE)):
+                curses.init_pair(LV_SHELL + 1 + i, c, -1)
     except curses.error:
         pass
 
@@ -1004,14 +1013,41 @@ def fmt_J(J):
     return ("%d" % J) if abs(J - round(J)) < 1e-9 else ("%d/2" % round(2 * J))
 
 
-def fmt_lam(lam, air):
+LAMW = 12      # every formatted wavelength is exactly this wide: right-aligned number + 2-char unit
+
+
+def fmt_lam(lam, air, nm=False):
+    """Wavelength (input in vacuum angstrom), always LAMW characters.  nm=True (allowed lines):
+    nanometres up to 10 um, then micrometres; otherwise angstrom below 1 um, then um, then cm."""
     if air:
         lam = vac_to_air(lam)
+    if nm:
+        return ("%9.3f nm" % (lam / 10.0)) if lam < 1.0e5 else ("%9.4f \u00b5m" % (lam / 1.0e4))
     if lam < 1.0e4:
-        return "%.2f Å" % lam
+        return "%9.2f \u00c5 " % lam
     if lam < 1.0e8:
-        return "%.4f µm" % (lam / 1.0e4)
-    return "%.2f cm" % (lam / 1.0e8)
+        return "%9.4f \u00b5m" % (lam / 1.0e4)
+    return "%9.2f cm" % (lam / 1.0e8)
+
+
+TAGW = (6, LAMW, 9, 6, 3, 9)   # level-list tag columns: ->target, wavelength, A, source, +N, est
+
+
+def tag_header(mode):
+    """Header for the level-list tag columns; same widths as the tags themselves."""
+    labels = [("\u2192J_l" if mode == "M1" else "\u2192lev#", "<"),
+              ("\u03bb_" + ("air" if OPT["m1air"] else "vac"), ">"),
+              ("A_NIST" if mode == "NIST" else "A_est", ">"),
+              ("grade" if mode == "NIST" else ("method" if mode == "E1" else ""), "<"),
+              ("+N", "<"),
+              ("A_est" if mode == "NIST" else "", ">")]
+    return "".join(fit(t, w, a) + " " for (t, a), w in zip(labels, TAGW)).rstrip()
+
+
+def fit(text, width, align="<"):
+    """Pad or cut text to exactly `width` characters."""
+    text = str(text)[:width]
+    return text.rjust(width) if align == ">" else text.ljust(width)
 
 
 def lam_attr(lam):
@@ -1738,10 +1774,14 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
         return estcache[mode]
 
     def lines_all(mode):
-        nist = nist_matched(mode == "NIST")
-        if mode not in linecache:
-            est = estimates("M1") + estimates("E1") if mode == "NIST" else estimates(mode)
-            linecache[mode] = merge_lines(est, nist, mode)
+        """M1 / E1: our estimates only.  NIST: NIST's lines with our estimates attached."""
+        if mode == "NIST":
+            nist = nist_matched(True)
+            if mode not in linecache:
+                linecache[mode] = merge_lines(estimates("M1") + estimates("E1"), nist, "NIST")
+        elif mode not in linecache:
+            linecache[mode] = [tuple(t[:7]) + ({"est": t[0], "nist": None, "acc": "", "type": mode},)
+                               for t in estimates(mode)]
         return linecache[mode]
 
     def by_upper(mode):
@@ -1758,6 +1798,8 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
     throttle = Throttle()
     emax = max((r[3] for r in rows), default=0.0) or 1.0
     attr_cache = {}
+    _present = {outer_l(r[0]) for r in rows if not is_limit(r[0], r[1])}
+    shells_here = [l_ for l_ in SHELLS if l_ in _present]
 
     def row_attrs(r):
         """(conf, term, energy) colour attrs, or 'limit'; computed once per row."""
@@ -1768,8 +1810,7 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 a = "limit"
             else:
                 ol = outer_l(conf)
-                ca = curses.color_pair(LV_BASE + 1 + LV_L.index(ol)) if ol in LV_L else (
-                    curses.color_pair(LV_BASE + 5) if ol else 0)
+                ca = curses.color_pair(LV_SHELL + 1 + SHELLS.index(ol)) if ol in SHELLS else 0
                 ta = curses.color_pair(LV_ODD if is_odd(term) else LV_EVEN) if term else 0
                 ea = curses.color_pair(LV_RAMP + min(9, max(0, int(10 * e / emax))))
                 a = (ca, ta, ea | (curses.A_DIM if flag else 0))
@@ -1801,7 +1842,7 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
             top = st["cur"] - page + 1
         uname = UNITS[st["unit"]][0]
         mode = st["mode"]
-        annw = 58 if mode else 0
+        annw = sum(TAGW) + len(TAGW) + 2 if mode else 0
         narrow = bool(mode) and w < 43 + annw + 12          # tags on, little room: hide the configuration
         termw, ew = (9, 12) if narrow else (12, 14)
         confw = 0 if narrow else max(10, min(60, w - 43 - annw))
@@ -1813,14 +1854,14 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
             put(win, 0, 1, "%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage)), curses.A_BOLD)
             put(win, 1, 1, "%5s %s%-*s %-6s %*s" % ("#", ("%-*s " % (confw, "configuration")) if confw else "",
                                                     termw, "term", "J", ew, "E / " + uname)
-                + ("  %-50s" % ("%s →%s  λ_%s  A/s⁻¹   source / est" % (
-                    mode, "J_l" if mode == "M1" else "#lev", "air" if OPT["m1air"] else "vac"))
-                   if mode else ""), curses.A_DIM | curses.A_UNDERLINE)
+                + (("  " + tag_header(mode)) if mode else ""), curses.A_DIM | curses.A_UNDERLINE)
             if st["col"] and n:
                 lx = 1 + len("%s %s  (%s)  energy levels" % (sym, roman(stage), ion_label(sym, stage))) + 3
-                for txt, a in ([("outer:", curses.A_DIM)] +
-                               [(l_, curses.color_pair(LV_BASE + 1 + i_)) for i_, l_ in enumerate("spdf")] +
-                               [("  parity:", curses.A_DIM), ("even", curses.color_pair(LV_EVEN)),
+                put(win, 0, lx, "outer:", curses.A_DIM)
+                for i_, l_ in enumerate(shells_here):
+                    put(win, 0, lx + 7 + 2 * i_, l_, curses.color_pair(LV_SHELL + 1 + SHELLS.index(l_)) | curses.A_BOLD)
+                lx += 7 + 2 * len(SHELLS)              # padded: legend width doesn't depend on the ion
+                for txt, a in ([("parity:", curses.A_DIM), ("even", curses.color_pair(LV_EVEN)),
                                 ("odd*", curses.color_pair(LV_ODD)), ("  E:", curses.A_DIM)] +
                                [("█", curses.color_pair(LV_RAMP + i_)) for i_ in range(10)]):
                     put(win, 0, lx, txt, a)
@@ -1836,26 +1877,31 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 lines_here = m1map.get(id(view[k])) if mode else None
                 if lines_here:
                     A_, lam_, _, lo_, _, Jl_, tag_, info_ = lines_here[0]
-                    ax = 1 + len("".join(cells)) + 2
-                    more = " +%d" % (len(lines_here) - 1) if len(lines_here) > 1 else ""
                     on = k == st["cur"]
                     if mode == "M1":
                         tgt = fmt_J(Jl_)
                     else:
                         tgt = "#%d" % (vidx[id(lo_)] + 1) if id(lo_) in vidx else fmt_J(Jl_) or "?"
-                    put(win, y, ax, "→%-5s" % tgt, curses.A_REVERSE if on else curses.A_BOLD)
-                    put(win, y, ax + 7, "%-13s" % fmt_lam(lam_, OPT["m1air"]),
-                        curses.A_REVERSE if on else lam_attr(lam_))
-                    put(win, y, ax + 21, "%-9.2e" % A_, curses.A_REVERSE if on else a_attr(A_, line_kind(info_, mode)))
+                    kind_ = line_kind(info_, mode)
                     if info_["nist"] is not None:
-                        src_txt, src_attr = "N:%-4s" % (info_["acc"] or "?"), curses.color_pair(LV_EVEN) | curses.A_BOLD
+                        src_txt, src_attr = "N:" + (info_["acc"] or "?"), curses.color_pair(LV_EVEN) | curses.A_BOLD
                     elif mode == "E1":
-                        src_txt, src_attr = "%-6s" % tag_, method_attr(tag_)
+                        src_txt, src_attr = tag_, method_attr(tag_)
                     else:
-                        src_txt, src_attr = "est   ", curses.A_DIM
-                    est_txt = (" est %.2e" % info_["est"]) if (info_["nist"] is not None and info_["est"]) else ""
-                    put(win, y, ax + 31, src_txt, curses.A_REVERSE if on else src_attr)
-                    put(win, y, ax + 31 + len(src_txt), more + est_txt, curses.A_REVERSE if on else curses.A_DIM)
+                        src_txt, src_attr = "est", curses.A_DIM
+                    est_txt = ""
+                    if mode == "NIST":
+                        est_txt = ("%9.2e" % info_["est"]) if info_["est"] else fit("-", 9, ">")
+                    parts = [("\u2192" + tgt, TAGW[0], "<", curses.A_BOLD),
+                             (fmt_lam(lam_, OPT["m1air"], kind_ == "E1"), TAGW[1], "<", lam_attr(lam_)),
+                             ("%9.2e" % A_, TAGW[2], ">", a_attr(A_, kind_)),
+                             (src_txt, TAGW[3], "<", src_attr),
+                             (("+%d" % (len(lines_here) - 1)) if len(lines_here) > 1 else "", TAGW[4], "<", curses.A_DIM),
+                             (est_txt, TAGW[5], ">", curses.A_DIM)]
+                    x_ = 1 + len("".join(cells)) + 2
+                    for txt_, wd_, al_, at_ in parts:
+                        put(win, y, x_, fit(txt_, wd_, al_) + " ", curses.A_REVERSE if on else at_)
+                        x_ += wd_ + 1
                 if k == st["cur"] or not st["col"]:
                     attr = curses.A_REVERSE if k == st["cur"] else (curses.A_BOLD if hit(view[k]) else 0)
                     put(win, y, 1, "".join(cells), attr)
@@ -1877,9 +1923,9 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                     put(win, 3 + i // width, 2, msg[i:i + width])
             put(win, h - 2, 1, "%d levels  [%d/%d]  units: %s  sort: %s  src: %s" % (
                 n, st["cur"] + 1 if n else 0, n, uname, "energy" if st["sort"] else "NIST order", source)
-                + ("   %s: %d lines, A ≥ %g  %s  (f next  F list  t cut  a air/vac)" % (
+                + ("   %s: %d lines, A ≥ %g%s  (f next  F list  t cut  a air/vac)" % (
                     mode, sum(len(v) for v in m1map.values()), MODES[mode]["cuts"][OPT["cut"][mode]],
-                    nist_status(nst))
+                    ("  " + nist_status(nst)) if mode == "NIST" else "  estimates")
                    if mode else ""),
                 curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
@@ -1944,10 +1990,10 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                     else nist_status(nst)
             else:
                 st["msg"] = "line tags off"
-            if st["mode"] in ("M1", "E1") and not nst["have"]:
-                st["msg"] += "   [estimates only: f to the NIST state queries NIST]"
+
         elif c == "F":
-            res = lines_view(win, sym, stage, lines_all(st["mode"] or "M1"), st["mode"] or "M1", nst)
+            md = st["mode"] or "M1"
+            res = lines_view(win, sym, stage, lines_all(md), md, nst if md == "NIST" else None)
             if res == "quit":
                 return "quit"
             if isinstance(res, tuple) and res[1] in view:
@@ -2000,7 +2046,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
     throttle = Throttle()
     top = 0
     M = MODES[mode]
-    SORTS = ["A", "λ", "est/NIST"]
+    SORTS = ["A", "λ", "est/NIST"] if mode == "NIST" else ["A", "λ"]
 
     def ratio(t):
         i = t[7]
@@ -2030,7 +2076,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
             top = st["cur"] - page + 1
         lamh = "λ_" + ("air" if OPT["m1air"] else "vac")
         lastw = 7 if mode != "NIST" else 6
-        extra_w = max(0, w - 2 - 76)
+        extra_w = max(0, w - 2 - (79 if mode == "NIST" else 65))
         confw = max(0, min(30, (extra_w - 8) // 2))
         if throttle.should_draw(win):
             win.erase()
@@ -2038,13 +2084,18 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
             nist_note = ("   " + nist_status(nst)) if nst is not None else ""
             put(win, 1, 1, M["formula"] + nist_note, curses.A_DIM)
             last = {"M1": "f", "E1": "method", "NIST": "type"}[mode]
-            head = "%4s %-8s %-5s  %-8s %-5s %-12s %9s %-3s %9s %-*s" % (
-                "#", "upper", "J", "lower", "J", lamh, "A_NIST", "acc", "A_est", lastw, last)
-            if extra_w >= 8:
-                head += " %7s" % "est/N"
+            # column spec: (header, width, align); rows below use exactly the same widths
+            spec = [("#", 4, ">"), ("upper", 8, "<"), ("J", 5, "<"), ("", 1, "<"), ("lower", 8, "<"), ("J", 5, "<"),
+                    (lamh, LAMW, ">")]
+            if mode == "NIST":
+                spec += [("A_NIST", 9, ">"), ("acc", 3, "<")]
+            spec += [("A_est", 9, ">"), (last, lastw, "<")]
+            if extra_w >= 8 and mode == "NIST":
+                spec += [("est/N", 6, ">")]
             if confw >= 6:
-                head += " %-*s %-*s" % (confw, "upper conf", confw, "lower conf")
-            put(win, 2, 1, head, curses.A_DIM | curses.A_UNDERLINE)
+                spec += [("upper conf", confw, "<"), ("lower conf", confw, "<")]
+            put(win, 2, 1, "".join(fit(h_, w_, a_) + " " for h_, w_, a_ in spec).rstrip(),
+                curses.A_DIM | curses.A_UNDERLINE)
             for i in range(page):
                 k = top + i
                 if k >= n:
@@ -2053,34 +2104,34 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                 y, on = 3 + i, k == st["cur"]
                 kind = line_kind(info, mode)
                 if mode == "M1":
-                    last_txt, last_attr = ("%-7.3f" % tag) if isinstance(tag, float) else "%-7s" % "-", curses.A_DIM
+                    last_txt, last_attr = ("%.3f" % tag) if isinstance(tag, float) else "-", curses.A_DIM
                 elif mode == "E1":
-                    last_txt = "%-7s" % (tag if tag else "NIST")
+                    last_txt = tag if tag else "NIST"
                     last_attr = method_attr(tag) if tag else curses.color_pair(LV_EVEN)
                 else:
-                    last_txt, last_attr = "%-6s" % (info["type"] or "E1")[:6], curses.A_DIM
-                cells = [("%4d " % (k + 1), curses.A_DIM),
-                         ("%-8s " % up[1][:8], 0), ("%-4s→ " % (fmt_J(Ju) if Ju is not None else "?"), 0),
-                         ("%-8s " % lo[1][:8], 0), ("%-5s " % (fmt_J(Jl) if Jl is not None else "?"), 0),
-                         ("%-12s " % fmt_lam(lam, OPT["m1air"]), lam_attr(lam)),
-                         (("%9.2e " % info["nist"]) if info["nist"] is not None else "%9s " % "-",
-                          a_attr(info["nist"], kind) if info["nist"] is not None else curses.A_DIM),
-                         ("%-3s " % (info["acc"] or "")[:3], curses.color_pair(LV_EVEN)),
-                         (("%9.2e " % info["est"]) if info["est"] else "%9s " % "-",
+                    last_txt, last_attr = (info["type"] or "E1"), curses.A_DIM
+                vals = [("%d" % (k + 1), curses.A_DIM), (up[1], 0),
+                        (fmt_J(Ju) if Ju is not None else "?", 0), ("\u2192", curses.A_DIM),
+                        (lo[1], 0), (fmt_J(Jl) if Jl is not None else "?", 0),
+                        (fmt_lam(lam, OPT["m1air"], kind == "E1"), lam_attr(lam))]
+                if mode == "NIST":
+                    vals += [(("%.2e" % info["nist"]) if info["nist"] is not None else "-",
+                              a_attr(info["nist"], kind) if info["nist"] is not None else curses.A_DIM),
+                             (info["acc"] or "", curses.color_pair(LV_EVEN))]
+                vals += [(("%.2e" % info["est"]) if info["est"] else "-",
                           a_attr(info["est"], kind) if info["est"] else curses.A_DIM),
                          (last_txt, last_attr)]
-                if extra_w >= 8:
+                if extra_w >= 8 and mode == "NIST":
                     r_ = ratio(v[k])
                     bad = r_ is not None and (r_ > 3 or r_ < 1 / 3.0)
-                    cells.append((" %7s" % (("%.2f" % r_) if r_ else "-"),
-                                  (curses.color_pair(LV_BASE + 1) if bad else curses.A_DIM)))
+                    vals.append((("%.2f" % r_) if r_ else "-",
+                                 curses.color_pair(LV_BASE + 1) if bad else curses.A_DIM))
                 if confw >= 6:
-                    cells += [(" %-*s" % (confw, up[0][:confw]), curses.A_DIM),
-                              (" %-*s" % (confw, lo[0][:confw]), curses.A_DIM)]
+                    vals += [(up[0], curses.A_DIM), (lo[0], curses.A_DIM)]
                 x = 1
-                for txt, a in cells:
-                    put(win, y, x, txt, curses.A_REVERSE if on else a)
-                    x += len(txt)
+                for (txt, a), (_, wd, al) in zip(vals, spec):
+                    put(win, y, x, fit(txt, wd, al) + " ", curses.A_REVERSE if on else a)
+                    x += wd + 1
             if n == 0:
                 cut = M["cuts"][OPT["cut"][mode]]
                 why = (" above A = %g s^-1 (t to change)" % cut) if cut else (
@@ -2089,7 +2140,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                     ": needs opposite-parity terms whose configurations differ by one electron"
                     if mode == "E1" else ": NIST has no transition probabilities for this ion, or they could not be fetched")
                 put(win, 4, 2, "no %s lines%s" % (mode, why))
-            summary = ("   %d with both values, median est/NIST %.2f" % (n_both, med)) if med else ""
+            summary = ("   %d with both values, median est/NIST %.2f" % (n_both, med)) if (med and mode == "NIST") else ""
             put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s%s   t cut  s sort  a air/vac  Enter goto  q back" % (
                 n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]], SORTS[st["sort"]], summary),
                 curses.A_DIM)
