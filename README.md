@@ -21,21 +21,26 @@ This is completely vibecoded. By design, I have not looked at any of the code by
 
 ## Usage
 
+Install it once somewhere on your `PATH`:
+
 ```bash
 chmod +x periodic.py
-./periodic.py [element]
+cp periodic.py ~/.local/bin/periodic      # or any other directory on your PATH
 ```
 
-Examples:
+Then just type:
 
 ```bash
-./periodic.py          # start at Hydrogen (Z = 1)
-./periodic.py Fe       # jump to Iron by symbol
-./periodic.py 26       # jump to Iron by atomic number
-./periodic.py iron     # search by name
+periodic
 ```
 
-To launch it as `periodic`, copy it onto your `PATH`, e.g. `cp periodic.py ~/.local/bin/periodic`.
+It opens at hydrogen. You can also start on a particular element:
+
+```bash
+periodic Fe       # by symbol
+periodic 26       # by atomic number
+periodic iron     # by name
+```
 
 ## Keybindings and commands
 
@@ -91,13 +96,13 @@ Lists every ionization stage with its charge, electron count and isoelectronic s
 | `c` | Colour coding on / off (see below) |
 | `f` | Cycle line tags: M1 → E1 → NIST → off |
 | `F` | Full line list for the current mode (M1 if tags are off) |
-| `s` (in the `F` list) | Cycle sort: A, wavelength, worst estimate-vs-NIST agreement first |
+| `s` (in the `F` list) | Cycle sort: A, wavelength; in the NIST list also worst estimate-vs-NIST agreement first |
 | `t` | Cycle the minimum A-value shown |
 | `a` | Vacuum / air wavelengths |
 | `r` | Refetch the levels from NIST ASD, bypassing the cache (the lines are refetched on the next visit to the NIST state) |
 | `q`, `Esc`, `:q`, `ZZ` | Back to the picker / table (`:qa` quits the app) |
 
-**Colour coding.** Configuration is coloured by its outermost written subshell (s, p, d, f). The term is coloured by parity (even, or odd, marked `*` by NIST). Energy runs from red (low) to blue (high), like photon colour. The ionization limit is shown in yellow, and derived or uncertain levels (`[ ]`, `( )`) are dimmed.
+**Colour coding.** Configuration is coloured by its outermost written subshell, with a distinct colour for each of s, p, d, f, g, h, i and k; the header legend lists only the subshells that occur in the current level list. The term is coloured by parity (even, or odd, marked `*` by NIST). Energy runs from red (low) to blue (high), like photon colour. The ionization limit is shown in yellow, and derived or uncertain levels (`[ ]`, `( )`) are dimmed.
 
 ## Line estimates
 
@@ -105,16 +110,23 @@ These are quick, order-of-magnitude guides for spotting potentially important li
 
 ### M1 lines (`f` once)
 
-These are lines between levels of the same configuration and LS term with ΔJ = ±1. They use the empirical formula
+These are lines between levels of the same configuration and LS term with $\Delta J = \pm 1$. They use the empirical formula
 
-A_ul = 1.3 s⁻¹ (λ_ul / 4 µm)⁻³ f(J, L, S)
+$$
+A_{ul} = 1.3\ \mathrm{s^{-1}} \left( \frac{\lambda_{ul}}{4\ \mu\mathrm{m}} \right)^{-3} f(J, L, S),
+$$
 
-where J = J_u, and
+where $J = J_u$ and
 
-- f = (J² − (L−S)²)((L+S+1)² − J²) / (12J(2J+1)) for J_u = J_l + 1
-- f = ((J+1)² − (L−S)²)((L+S+1)² − (J+1)²) / (12(J+1)(2J+1)) for J_u = J_l − 1
+$$
+f(J, L, S) =
+\begin{cases}
+\dfrac{\left(J^2 - (L-S)^2\right)\left((L+S+1)^2 - J^2\right)}{12\,J\,(2J+1)}, & J_u = J_l + 1, \\[2ex]
+\dfrac{\left((J+1)^2 - (L-S)^2\right)\left((L+S+1)^2 - (J+1)^2\right)}{12\,(J+1)(2J+1)}, & J_u = J_l - 1.
+\end{cases}
+$$
 
-This is a pure-LS estimate, so expect it to degrade for heavy or highly charged ions. As spot checks, it gives about 62 s⁻¹ for the Fe XIV 5303 Å coronal line, 1.0×10⁻⁴ and 2.7×10⁻⁵ s⁻¹ for [O III] 52 and 88 µm, and 2.2×10⁻³ s⁻¹ for [Fe II] 26 µm.
+This is a pure-LS estimate, so expect it to degrade for heavy or highly charged ions. As spot checks, it gives about $62\ \mathrm{s^{-1}}$ for the Fe XIV 5303 Å coronal line, $1.0\times10^{-4}$ and $2.7\times10^{-5}\ \mathrm{s^{-1}}$ for [O III] 52 and 88 µm, and $2.2\times10^{-3}\ \mathrm{s^{-1}}$ for [Fe II] 26 µm.
 
 > **TODO:** add the reference for the empirical M1 formula above.
 
@@ -122,62 +134,88 @@ This is a pure-LS estimate, so expect it to degrade for heavy or highly charged 
 
 **Candidates** must satisfy all of:
 - parity changes
-- |ΔJ| ≤ 1, excluding 0 → 0
-- LS-allowed when both terms are LS: ΔS = 0, |ΔL| ≤ 1, no S → S. Pairs with a non-LS term (jK, jj) are kept and marked `jj`.
-- the two configurations differ by a single electron, n_a l_a ← n_b l_b, with |Δl| = 1
+- $\lvert \Delta J \rvert \le 1$, excluding $0 \to 0$
+- LS-allowed when both terms are LS: $\Delta S = 0$, $\lvert \Delta L \rvert \le 1$, no $S \to S$. Pairs with a non-LS term (jK, jj) are kept and marked `jj`.
+- the two configurations differ by a single electron, $n_a l_a \leftarrow n_b l_b$, with $\lvert \Delta l \rvert = 1$
 
-**A-value.** The A-value is converted from an oscillator strength with the standard relation A_ki = 6.670×10¹⁵ (g_i/g_k) f_ik / λ² (λ in Å), as given in the [NIST Atomic Spectroscopy compendium](https://www.nist.gov/pml/atomic-spectroscopy-compendium-basic-ideas-notation-data-and-formulas/atomic-spectroscopy). The one-electron oscillator strength is estimated hydrogenically, using effective quantum numbers n* = ζ √(Ry / (E_limit − E)) (ζ = ion stage) taken from the ionization limit in the level list:
+**A-value.** The A-value is converted from an oscillator strength with the standard relation, as given in the [NIST Atomic Spectroscopy compendium](https://www.nist.gov/pml/atomic-spectroscopy-compendium-basic-ideas-notation-data-and-formulas/atomic-spectroscopy):
+
+$$
+A_{ki} = \frac{6.670\times10^{15}}{\lambda^2}\,\frac{g_i}{g_k}\,f_{ik}\ \mathrm{s^{-1}}, \qquad \lambda \text{ in Å}.
+$$
+
+The one-electron oscillator strength is estimated hydrogenically, using effective quantum numbers taken from the ionization limit in the level list:
+
+$$
+n^* = \zeta \sqrt{\frac{\mathrm{Ry}}{E_\text{limit} - E}}, \qquad \zeta = \text{ion stage}.
+$$
 
 | Case | Oscillator strength | Tag |
 | --- | --- | --- |
-| Same shell (Δn = 0) | f₀ = (ΔE/Ry)/3 · l_>/(2l_a+1) · σ², with σ = (3/2)(n̄*/ζ)√(n̄*² − l_>²) | `dn0` |
-| Δn ≠ 0 | Exact hydrogenic f_H(n_a l_a → n_b l_b) with the integer n of the configuration, blended with f₀ by how much of the integer Δn survives in the effective quantum numbers: f = f₀^(1−x) · f_H^x, with x = Δn*/Δn clipped to the range 0–1. Large quantum defects shrink Δn*, and the line then behaves more like a same-shell line | `hyd` (x > 0.9), `mix` |
-| No ionization limit in the list | f = f_H for Δn ≠ 0, otherwise 1 | `hyd`, `f=1` |
-| Any of the above reaching f ≥ 1 | capped at 1 | `f=1` |
+| Same shell ($\Delta n = 0$) | $f_0 = \dfrac{\Delta E}{3\,\mathrm{Ry}} \cdot \dfrac{l_>}{2l_a+1}\,\sigma^2$, with $\sigma = \dfrac{3}{2}\,\dfrac{\bar n^*}{\zeta}\sqrt{\bar n^{*2} - l_>^2}$ | `dn0` |
+| $\Delta n \ne 0$ | Exact hydrogenic $f_H(n_a l_a \to n_b l_b)$ with the integer $n$ of the configuration, blended with $f_0$ by how much of the integer $\Delta n$ survives in the effective quantum numbers: $f = f_0^{\,1-x} f_H^{\,x}$, with $x = \Delta n^* / \Delta n$ clipped to $[0, 1]$. Large quantum defects shrink $\Delta n^*$, and the line then behaves more like a same-shell line | `hyd` ($x > 0.9$), `mix` |
+| No ionization limit in the list | $f = f_H$ for $\Delta n \ne 0$, otherwise $1$ | `hyd`, `f=1` |
+| Any of the above reaching $f \ge 1$ | capped at $1$ | `f=1` |
 
-The result is then scaled by the occupancy factor N_b × (vacancies in n_a l_a)/(2(2l_a+1)), and split among the lower levels with LS recoupling (Wigner 6j) factors. Each factor sums to 1, so an upper level's total decay rate is unchanged and only its distribution between lines is affected:
+The result is then scaled by the occupancy factor
 
-- **J branching** within a multiplet, whenever both terms are LS: F_J = (2J_l+1){L_u J_u S; J_l L_l 1}², normalised over J_l.
-- **Term branching** when both configurations show the same parent term L_c (e.g. `3d6.(5D).4p` → `3d6.(5D).4s`), or the core is closed: F_term = (2L_l+1){l_b L_u L_c; L_l l_a 1}², normalised over the lower terms the parent allows.
-- **No stated parent** (e.g. `4s2.4p2`, `3d7`): the lower terms present share by (2L_l+1)(2S+1), and the line is tagged `~`.
-- **Any non-LS term** in the group: fallback to (2J_l+1) sharing.
+$$
+N_b \times \frac{\text{vacancies in } n_a l_a}{2(2l_a+1)},
+$$
+
+and split among the lower levels with LS recoupling (Wigner 6j) factors. Each factor sums to 1, so an upper level's total decay rate is unchanged and only its distribution between lines is affected:
+
+- **J branching** within a multiplet, whenever both terms are LS, normalised over $J_l$:
+
+$$
+F_J = (2J_l+1)\begin{Bmatrix} L_u & J_u & S \\ J_l & L_l & 1 \end{Bmatrix}^2
+$$
+
+- **Term branching** when both configurations show the same parent term $L_c$ (e.g. `3d6.(5D).4p` → `3d6.(5D).4s`), or the core is closed, normalised over the lower terms the parent allows:
+
+$$
+F_\text{term} = (2L_l+1)\begin{Bmatrix} l_b & L_u & L_c \\ L_l & l_a & 1 \end{Bmatrix}^2
+$$
+
+- **No stated parent** (e.g. `4s2.4p2`, `3d7`): the lower terms present share by $(2L_l+1)(2S+1)$, and the line is tagged `~`.
+- **Any non-LS term** in the group: fallback to $(2J_l+1)$ sharing.
 
 The 6j symbols use Racah's formula and are cached, so this costs almost nothing.
 
-A `?` after the tag marks a d or f orbital with n*² ≤ l(l+1), where the hydrogenic picture is poor; a `~` marks a line whose lower-term split had no parent to go on.
+A `?` after the tag marks a d or f orbital with $n^{*2} \le l(l+1)$, where the hydrogenic picture is poor; a `~` marks a line whose lower-term split had no parent to go on.
 
-**Inner-subshell jumps (`ci`).** These are lines of the type ns np^(k+1) → ns² np^k, such as C II 2s2p² → 2s²2p or Se III 4s4p³ → 4s²4p². Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
-- the p electron uses the valence binding of the lower level, E_limit − E_lower
-- the s electron is bound more deeply by the excitation energy, E_limit − E_lower + ΔE
+**Inner-subshell jumps (`ci`).** These are lines of the type $ns\,np^{k+1} \to ns^2\,np^k$, such as C II $2s2p^2 \to 2s^2 2p$ or Se III $4s4p^3 \to 4s^2 4p^2$. Here the electron fills a hole in an inner s subshell, so it can't be given the binding energy of the outermost electron. For these lines:
+- the p electron uses the valence binding of the lower level, $E_\text{limit} - E_\text{lower}$
+- the s electron is bound more deeply by the excitation energy, $E_\text{limit} - E_\text{lower} + \Delta E$
 
-This brings C II 1335.7 Å to 2.8×10⁸ s⁻¹ (NIST 2.9×10⁸). In heavier ions, though, ns np^(k+1) mixes strongly with ns² np^(k−1) nd, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III 4s4p³ → 4s²4p², the estimate is about 8×10⁸ s⁻¹, against about 5×10⁷ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
+This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\times10^{8}$). In heavier ions, though, $ns\,np^{k+1}$ mixes strongly with $ns^2\,np^{k-1}\,nd$, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III $4s4p^3 \to 4s^2 4p^2$, the estimate is about $8\times10^{8}\ \mathrm{s^{-1}}$, against about $5\times10^{7}$ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
 
 **Typical accuracy** against reference values:
 - Lyα and Hα: exact
 - strong resonance lines (Na D, Ca II H & K, Mg II): within about 10%
-- most Δn ≠ 0 lines (Na 4s→3p, Ca II 8542/8662, Se III 4p5s → 4p²): within about 2×
+- most $\Delta n \ne 0$ lines (Na $4s \to 3p$, Ca II 8542/8662 Å, Se III $4p5s \to 4p^2$): within about 2×
 - fine-structure splits within a multiplet: correct in pure LS (Hα components exact, C II 1334/1336 Å within 4%, the Ca II infrared triplet ratios and Fe II 2600/2626 Å right); heavier ions drift as intermediate coupling sets in
 
 **Known failures:**
-- `ci` lines (below): can be ~10× too high
-- alkali principal-series lines beyond the first, such as Na 3303 Å (4p → 3s): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
-- lines from a singlet upper level of ns np → ns², such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
+- `ci` lines (above): can be ~10× too high
+- alkali principal-series lines beyond the first, such as Na 3303 Å ($4p \to 3s$): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
+- lines from a singlet upper level of $ns\,np \to ns^2$, such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
 
 ### NIST transition probabilities
 
-NIST is only queried when you select the NIST state (`f` three times). That makes one request per ion for NIST ASD's lines with transition probabilities (allowed and forbidden), cached like the levels. `PERIODIC_LINES_DIR` is checked first for files named `lines_<El>+<charge>.txt`. The M1 and E1 states never touch the network, but they do use NIST values that are already on disk, from `PERIODIC_LINES_DIR` or the cache of an earlier NIST query. After `r`, the next visit to the NIST state refetches the lines. Each NIST line is matched to the level list by upper and lower energy and J, to within about 0.05 cm⁻¹; configuration and term strings aren't relied on.
+NIST is only queried when you select the NIST state (`f` three times). That makes one request per ion for NIST ASD's lines with transition probabilities (allowed and forbidden), cached like the levels. `PERIODIC_LINES_DIR` is checked first for files named `lines_<El>+<charge>.txt`. The M1 and E1 states show our estimates only: they never touch the network or NIST data on disk. After `r`, the next visit to the NIST state refetches the lines. Each NIST line is matched to the level list by upper and lower energy and J, to within about 0.05 cm⁻¹; configuration and term strings aren't relied on.
 
-- **Which value is shown.** Where NIST has a line, its A-value is displayed (and used for cuts, sorting and "strongest line"), tagged with its accuracy grade, e.g. `N:B+`. Our estimate is shown next to it. Where NIST has no value, the estimate is shown as before.
-- **NIST-only lines.** Lines our selection rules don't produce, such as intercombination, two-electron and E2/M2 lines, appear in the M1, E1 and NIST lists with an empty estimate column. NIST's `Type` column decides whether a line belongs to the M1 or the E1 view.
-- **The NIST state** (`f` three times) lists every NIST line with an A-value, with our estimate attached where it exists.
+- **The NIST state** lists every NIST line with an A-value. NIST's A (used for cuts, sorting and "strongest line") is shown with its accuracy grade, e.g. `N:B+`, followed by our estimate where we have one for the same pair of levels (`est -` where we don't).
+- **NIST-only lines.** Lines our selection rules don't produce, such as intercombination, two-electron and E2/M2 lines, appear in the NIST list with an empty estimate column; NIST's `Type` column is shown.
 - **The `F` list** shows `A_NIST`, the grade, `A_est` and `est/N` side by side. Ratios outside 1/3–3 are highlighted, and the status line gives the median est/NIST ratio for the ion. Sorting by worst agreement (`s` twice) brings the lines where the estimate fails most to the top.
-- **Without NIST data** (not queried yet, or unreachable), the estimates are shown on their own, and the status line says which.
+- **If NIST can't be reached,** the NIST state says so in the status line; the M1 and E1 states are unaffected.
 
 ### Where the tags appear
 
-- **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1, NIST), then λ and A. Next comes the source: `N:<grade>` for a NIST value, followed by our estimate as `est …` when we have one, or the E1 method tag / `est` for an estimate alone. `+N` means N more lines. In narrow windows the configuration column is hidden to make room, and the `est …` part may be cut off; the `F` list always shows both values.
+- **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1, NIST), then λ and A. Next comes the source: the E1 method tag or `est` in the M1 and E1 states, or `N:<grade>` in the NIST state, which is followed by our estimate as `est …`. `+N` means N more lines from that upper level in the current list, above the current cut. It therefore differs between states: the E1 list contains different lines from the NIST list, and hides $A < 10^{6}\ \mathrm{s^{-1}}$ by default. In narrow windows the configuration column is hidden to make room, and the `est …` part may be cut off; the `F` list always shows both values.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
 - **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`.
+- **Wavelength units.** Vacuum by default. Allowed (E1) lines, in the E1 state and E1-type lines in the NIST state, are given in nm (µm beyond 10 µm). M1 and other forbidden lines use Å below 1 µm and µm above.
 - **Air wavelengths** (`a`) use the refractive-index formula of [Morton (2000), ApJS 130, 403](https://doi.org/10.1086/317349) above 2000 Å.
 
 ## Environment variables and cache
