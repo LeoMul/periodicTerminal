@@ -643,6 +643,9 @@ VHELP = [
     "                   so = LS-forbidden line (dS != 0 or dL = 2) borrowing strength via spin-orbit mixing,",
     "                   ~ = no stated parent, so lower terms share by (2L+1)(2S+1)",
     "                   ci: ns np^(k+1) -> ns2 np^k type, often much weaker (configuration mixing)",
+    "v                  re-estimate the line under the cursor (level's main line, a branch row,",
+    "                   or an F-list row) with the next f method that applies: dn0 / hyd / mix /",
+    "                   f=1, then back to its default.  Overridden lines are tagged with !",
     "F                  full list for the current mode (NIST: A_NIST, grade, A_est, est/NIST)",
     "                   s cycles sort: A / wavelength (/ worst est-vs-NIST agreement first)",
     "t / a              cycle minimum A shown / air vs vacuum wavelengths",
@@ -789,7 +792,7 @@ def _parse_levels(text):
             continue
         get = lambda k: rec[cols[k]] if cols[k] is not None and cols[k] < len(rec) else ""
         lev = get("lev")
-        m = re.search(r"[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?", lev)
+        m = re.search(r"[0-9]+(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?", lev)
         if not m:
             continue
         pre = get("pre")
@@ -1183,7 +1186,7 @@ def f_H(na, la, nb, lb):
     return abs(1.0 / na ** 2 - 1.0 / nb ** 2) / 3.0 * max(la, lb) / (2 * la + 1) * sigma_H(na, la, nb, lb) ** 2
 
 
-def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
+def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False, force=None):
     """One-electron absorption f for a -> b -> (f, method tag).
     inner: a is an inner subshell of the lower configuration (b is already occupied there,
     e.g. ns2 np^k <- ns np^(k+1)).  Then the b electron is bound like a valence electron of the
@@ -1194,6 +1197,12 @@ def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
     lg = max(la, lb)
     fH = f_H(na, la, nb, lb) if na != nb else None
     if elim is None or E_up >= elim:
+        if force == "f=1":
+            return 1.0, "f=1"
+        if force == "hyd":
+            return (min(fH, 1.0), "hyd") if fH else None
+        if force:
+            return None                  # dn0 / mix need the ionization limit
         return (min(fH, 1.0), "hyd") if fH else (1.0, "f=1")
     if inner:
         nsa = zeta * math.sqrt(RY_CM / (elim - E_lo + (E_up - E_lo)))
@@ -1206,12 +1215,22 @@ def f_hydrogenic(ka, kb, E_lo, E_up, elim, zeta, inner=False):
     f0 = (E_up - E_lo) / RY_CM / 3.0 * lg / (2 * la + 1) * sig * sig
     pen = any(l >= 2 and ns * ns <= l * (l + 1) for l, ns in ((la, nsa), (lb, nsb)))
     q = (" ci" if inner else "") + ("?" if pen else "")
+    if force == "f=1":
+        return 1.0, "f=1" + q
+    if force == "dn0":
+        return min(f0, 1.0), "dn0" + q
+    if force == "hyd":
+        return (min(fH, 1.0), "hyd" + q) if fH else None
+    if force == "mix" and not fH:
+        return None
     if fH is None:
         return (min(f0, 1.0), ("dn0" if f0 < 1 else "f=1") + q)
     if fH <= 0:
         return (0.0, "hyd" + q)
     x = max(0.0, min(1.0, abs(nsb - nsa) / abs(nb - na)))
     f = math.exp((1 - x) * math.log(max(f0, 1e-30)) + x * math.log(fH))
+    if force == "mix":
+        return min(f, 1.0), "mix" + q
     if f >= 1.0:
         return 1.0, "f=1" + q
     return f, ("hyd" if x > 0.9 else "mix") + q
@@ -1302,6 +1321,35 @@ def _ls_allowed(a, b):
     return abs(Sa - Sb) < 1e-9 and abs(La - Lb) <= 1 + 1e-9 and not (La == 0 and Lb == 0)
 
 
+# Per-line recipe for the alternative estimates (filled by e1_lines; keyed by the level rows):
+#   A = scale * f(method),  f from f_hydrogenic(*args, force=method),  tag = ftag + extra
+RECIPES = {}
+F_METHODS = ("dn0", "hyd", "mix", "f=1")
+
+
+def line_methods(key, recipes=None):
+    """Methods that can be applied to this line, in cycling order."""
+    rc = (RECIPES if recipes is None else recipes).get(key)
+    if rc is None:
+        return []
+    return [m_ for m_ in F_METHODS if f_hydrogenic(*rc["args"], force=m_) is not None]
+
+
+def base_method(tag):
+    """'mix ci?' -> 'mix';  'f=1? so' -> 'f=1'."""
+    return tag.split()[0].rstrip("?~!") if isinstance(tag, str) and tag else ""
+
+
+def apply_override(t, method, recipes=None):
+    """Re-estimate a 7-tuple line with a chosen method; tag gets a '!' to show the choice."""
+    rc = (RECIPES if recipes is None else recipes).get((id(t[2]), id(t[3])))
+    r_ = f_hydrogenic(*rc["args"], force=method) if rc else None
+    if r_ is None:
+        return t
+    f, ftag = r_                     # '!' right after the method name, so narrow columns keep it
+    return (rc["scale"] * f,) + tuple(t[1:6]) + (method + "!" + ftag[len(method):] + rc["extra"],)
+
+
 def _so_lines(terms, so_pairs, elim, zeta):
     """LS-forbidden E1 lines (dS != 0 and/or |dL| = 2) made visible by spin-orbit mixing.
     A level mixes with 'partner' levels of the same configuration and J but another term; the
@@ -1361,22 +1409,25 @@ def _so_lines(terms, so_pairs, elim, zeta):
                 if (ku, kl) not in fcache:       # one f per pair of terms (term-averaged energies)
                     inner = tl["occ"].get(kb, 0) > 0
                     eu, el = max(ebar[ku], ebar[kl]), min(ebar[ku], ebar[kl])
-                    fcache[(ku, kl)] = f_hydrogenic(ka, kb, el, eu, elim, zeta, inner) if eu > el else (0.0, "")
-                f, tag = fcache[(ku, kl)]
+                    fcache[(ku, kl)] = (f_hydrogenic(ka, kb, el, eu, elim, zeta, inner) if eu > el else (0.0, ""),
+                                        (ka, kb, el, eu, elim, zeta, inner))
+                (f, tag), fargs = fcache[(ku, kl)]
                 cap_a = 2 * (2 * ka[1] + 1)
                 occ = tu["occ"].get(kb, 1) * max(0, cap_a - tu["occ"].get(ka, 0)) / cap_a
                 share = (2 * Jl + 1) / lowJ.get((kl[0], round(2 * Ju)), 2 * Jl + 1)
                 if occ <= 0 or f <= 0:
                     continue
                 lam = 1.0e8 / (up[3] - lo[3])
-                A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * share * e2
-                out.append((A, lam, up, lo, Ju, Jl, tag + " so"))
+                scale = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) / lam ** 2 * occ * share * e2
+                RECIPES[(id(up), id(lo))] = {"args": fargs, "scale": scale, "extra": " so"}
+                out.append((scale * f, lam, up, lo, Ju, Jl, tag + " so"))
     return out
 
 
 def e1_lines(rows, stage=1):
     """Candidate strong E1 lines -> list of (A, lam_vac_A, upper, lower, Ju, Jl, tag),
     strongest first."""
+    RECIPES.clear()
     limits = [r[3] for r in rows if is_limit(r[0], r[1])]
     elim, zeta = (min(limits) if limits else None), float(stage or 1)
     terms = {}
@@ -1469,8 +1520,10 @@ def e1_lines(rows, stage=1):
         if occ <= 0 or f <= 0:
             continue
         lam = 1.0e8 / (up[3] - lo[3])
-        A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * w
-        out.append((A, lam, up, lo, Ju, Jl, tag + mark + note))
+        scale = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) / lam ** 2 * occ * w
+        RECIPES[(id(up), id(lo))] = {"args": (ka, kb, lo[3], up[3], elim, zeta, inner),
+                                     "scale": scale, "extra": mark + note}
+        out.append((scale * f, lam, up, lo, Ju, Jl, tag + mark + note))
     out.extend(_so_lines(terms, so_pairs, elim, zeta))
     out.sort(key=lambda t: -t[0])
     return out
@@ -1486,7 +1539,7 @@ MODES = {
                       "split by LS 6j, x occupancy"},
 }
 MODES["NIST"] = {"cuts": [0.0, 1e-2, 1.0, 1e2, 1e4, 1e6, 1e8], "strong": 1e8, "moderate": 1e6,
-                 "title": "NIST ASD lines with transition probabilities",
+                 "title": "NIST ASD lines with transition probabilities, plus our estimates NIST lacks",
                  "formula": "A_NIST from NIST ASD (accuracy grade); A_est is ours where the line is in our M1/E1 sets"}
 A_CUTS = MODES["M1"]["cuts"]
 
@@ -1506,7 +1559,8 @@ def lines_url(sym, stage):
             "&term_out=on&enrg_out=on&J_out=on" % (sym, stage - 1))
 
 
-_NUM = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+# digits with an optional point and fraction, or a bare fraction; NIST writes e.g. "8.e+08"
+_NUM = re.compile(r"[-+]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?")
 
 
 def _num(x):
@@ -1666,7 +1720,8 @@ def merge_lines(est, nist, mode):
     """Estimated lines (7-tuples) + matched NIST lines -> 8-tuples
     (A_best, lam, up, lo, Ju, Jl, tag, info) with info = {est, nist, acc, type}.
     A_best is NIST's A when known, otherwise the estimate.  In mode 'NIST' every NIST line
-    is listed, with the matching estimate attached when there is one."""
+    is listed, with the matching estimate attached when there is one, followed by our
+    estimated lines that NIST has no value for (NIST fields left empty)."""
     nmap = {}
     for d in nist:
         key = (id(d["up"]), id(d["lo"]))
@@ -1681,6 +1736,13 @@ def merge_lines(est, nist, mode):
             info = {"est": e[0] if e else None, "nist": d["A"], "acc": d["acc"], "type": d["type"],
                     "method": method}
             out.append((d["A"], d["lam"], d["up"], d["lo"], d["Ju"], d["Jl"], d["type"], info))
+        for key, e in emap.items():
+            if key in nmap:
+                continue
+            m1 = not isinstance(e[6], str)
+            info = {"est": e[0], "nist": None, "acc": "", "type": "M1" if m1 else "E1",
+                    "method": "emp" if m1 else e[6]}
+            out.append(tuple(e[:6]) + ("M1" if m1 else "E1", info))
     else:
         for t in est:
             key = (id(t[2]), id(t[3]))
@@ -1849,6 +1911,7 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
           "col": not OPT["lite"], "mode": None, "exp": set(), "expall": False,
           "sub": None, "sub_owner": None}
     linecache, upcache, estcache = {}, {}, {}
+    ovr, recipes, e1base = {}, {}, []           # per-line method overrides (v), their recipes
     nst = {"recs": None, "err": None, "src": "", "have": False, "net_tried": False}
 
     def nist_matched(allow_net):
@@ -1870,8 +1933,50 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
 
     def estimates(mode):
         if mode not in estcache:
-            estcache[mode] = m1_lines(rows) if mode == "M1" else e1_lines(rows, stage)
+            if mode == "M1":
+                estcache[mode] = m1_lines(rows)
+            else:
+                if not e1base:
+                    e1base.extend(e1_lines(rows, stage))
+                    recipes.update(RECIPES)      # private copy: another ion may reuse RECIPES
+                estcache[mode] = [apply_override(t, ovr[k_], recipes) if k_ in ovr else t
+                                  for t in e1base for k_ in ((id(t[2]), id(t[3])),)]
+                if ovr:
+                    estcache[mode].sort(key=lambda t: -t[0])
         return estcache[mode]
+
+    def cycle_method(line):
+        """v: step one line to the next oscillator-strength method that applies to it, back
+        round to its default.  -> message."""
+        if line is None:
+            return "no line here"
+        info_ = line[7] if len(line) > 7 else {}
+        if isinstance(line[6], float) or info_.get("type") == "M1" or info_.get("method") == "emp":
+            return "M1 lines have one estimate only (the empirical formula)"
+        if len(line) > 7 and not info_.get("est") and info_.get("nist") is not None:
+            return "NIST line with no estimate of ours (no one-electron jump between these levels)"
+        estimates("E1")
+        key_ = (id(line[2]), id(line[3]))
+        meths = line_methods(key_, recipes)
+        dflt = next((base_method(t[6]) for t in e1base if (id(t[2]), id(t[3])) == key_), "")
+        if not meths:
+            return "no estimate for this line"
+        if len(meths) == 1 and meths[0] == dflt:
+            return "only %s applies to this line" % dflt
+        cur_ = ovr.get(key_, dflt)
+        order = [m_ for m_ in F_METHODS if m_ in meths or m_ == dflt]
+        nxt = order[(order.index(cur_) + 1) % len(order)] if cur_ in order else dflt
+        if nxt == dflt:
+            ovr.pop(key_, None)
+        else:
+            ovr[key_] = nxt
+        estcache.pop("E1", None)
+        linecache.clear()
+        upcache.clear()
+        t_ = next(t for t in estimates("E1") if (id(t[2]), id(t[3])) == key_)
+        return "%s -> %s  %s: A = %.2e s^-1  (%s)" % (
+            line[2][1], line[3][1], nxt, t_[0],
+            "default" if nxt == dflt else "override; v cycles: " + " ".join(order))
 
     def lines_all(mode):
         """M1 / E1: our estimates only.  NIST: NIST's lines with our estimates attached."""
@@ -1934,16 +2039,20 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
         else:
             src_txt, src_attr = "est", curses.A_DIM
         est_txt, meth_txt, meth_attr = "", "", curses.A_DIM
+        A_txt, A_attr = "%9.2e" % A_, a_attr(A_, kind_)
         if mode == "NIST":
             est_txt = ("%9.2e" % info_["est"]) if info_["est"] else fit("-", 9, ">")
             meth_txt = info_.get("method", "")
             meth_attr = method_attr(meth_txt) if meth_txt and meth_txt != "emp" else curses.A_DIM
+            if info_["nist"] is None:            # our estimate only: NIST columns blank
+                A_txt, src_txt = "", ""
+                est_attr = a_attr(info_["est"], kind_) if info_["est"] else curses.A_DIM
         return [("\u2192" + tgt, TAGW[0], "<", curses.A_BOLD),
                 (fmt_lam(lam_, OPT["m1air"], kind_ == "E1"), TAGW[1], "<", lam_attr(lam_)),
-                ("%9.2e" % A_, TAGW[2], ">", a_attr(A_, kind_)),
+                (A_txt, TAGW[2], ">", A_attr),
                 (src_txt, TAGW[3], "<", src_attr),
                 (plus, TAGW[4], "<", curses.A_DIM),
-                (est_txt, TAGW[5], ">", curses.A_DIM),
+                (est_txt, TAGW[5], ">", est_attr if (mode == "NIST" and info_["nist"] is None) else curses.A_DIM),
                 (meth_txt, TAGW[6], "<", meth_attr)]
 
     def branches(lines_here):
@@ -2166,7 +2275,8 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
 
         elif c == "F":
             md = st["mode"] or "M1"
-            res = lines_view(win, sym, stage, lines_all(md), md, nst if md == "NIST" else None)
+            res = lines_view(win, sym, stage, lines_all(md), md, nst if md == "NIST" else None,
+                             relist=lambda line_, md_=md: (cycle_method(line_), lines_all(md_)))
             if res == "quit":
                 return "quit"
             if isinstance(res, tuple) and res[1] in view:
@@ -2219,6 +2329,16 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 OPT["exp_frac"] = EXP_FRACS[0]
                 st["exp"].add(key_)
                 st["msg"] = "expanded lines cover %d%% of each level's rate" % round(100 * OPT["exp_frac"])
+        elif c == "v" and n:
+            if not st["mode"]:
+                st["msg"] = "turn on line tags with f first"
+            else:
+                br_ = disp[cur_d][1] if disp and cur_d < len(disp) else None
+                if br_ is not None:
+                    target = br_[1] if br_[0] == "line" else None
+                else:
+                    target = (m1map.get(id(view[st["cur"]])) or [None])[0]
+                st["msg"] = cycle_method(target)
         elif c == "t" and st["mode"]:
             md = st["mode"]
             OPT["cut"][md] = (OPT["cut"][md] + 1) % len(MODES[md]["cuts"])
@@ -2258,7 +2378,7 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 st["msg"] = "E492: Not an editor command: " + word
 
 
-def lines_view(win, sym, stage, lines, mode, nst=None):
+def lines_view(win, sym, stage, lines, mode, nst=None, relist=None):
     """Full line list, strongest first, with NIST and estimated A side by side.
     -> 'close', 'quit' or ('goto', upper, mode)."""
     st = {"cur": 0, "count": "", "pend": "", "msg": "", "sort": 0}
@@ -2280,17 +2400,21 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
             return sorted(v_, key=lambda t: -abs(math.log10(ratio(t))) if ratio(t) else 1e9)
         return v_
 
+    def stats():
+        n_both_ = sum(1 for t in lines if t[7]["est"] and t[7]["nist"])
+        rs = sorted(math.log10(ratio(t)) for t in lines if ratio(t))
+        med_ = (10 ** rs[len(rs) // 2]) if rs else None
+        by_method = {}
+        for t in lines:
+            if ratio(t):
+                base = base_method(t[7].get("method") or "") or "?"
+                by_method.setdefault(base, []).append(math.log10(ratio(t)))
+        summ = "  ".join("%s %.2f (%d)" % (k_, 10 ** sorted(v_)[len(v_) // 2], len(v_))
+                         for k_, v_ in sorted(by_method.items(), key=lambda kv: -len(kv[1])))
+        return n_both_, med_, summ
+
     v = visible()
-    n_both = sum(1 for t in lines if t[7]["est"] and t[7]["nist"])
-    rs = sorted(math.log10(ratio(t)) for t in lines if ratio(t))
-    med = (10 ** rs[len(rs) // 2]) if rs else None
-    by_method = {}
-    for t in lines:
-        if ratio(t):
-            base = (t[7].get("method") or "").split()[0].rstrip("?~") or "?"
-            by_method.setdefault(base, []).append(math.log10(ratio(t)))
-    method_summary = "  ".join("%s %.2f (%d)" % (k_, 10 ** sorted(v_)[len(v_) // 2], len(v_))
-                               for k_, v_ in sorted(by_method.items(), key=lambda kv: -len(kv[1])))
+    n_both, med, method_summary = stats()
     while True:
         h, w = win.getmaxyx()
         page = max(1, h - 5)
@@ -2348,7 +2472,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                         (lo[1], 0), (fmt_J(Jl) if Jl is not None else "?", 0),
                         (fmt_lam(lam, OPT["m1air"], kind == "E1"), lam_attr(lam))]
                 if mode == "NIST":
-                    vals += [(("%.2e" % info["nist"]) if info["nist"] is not None else "-",
+                    vals += [(("%.2e" % info["nist"]) if info["nist"] is not None else "",
                               a_attr(info["nist"], kind) if info["nist"] is not None else curses.A_DIM),
                              (info["acc"] or "", curses.color_pair(LV_EVEN))]
                 vals += [(("%.2e" % info["est"]) if info["est"] else "-",
@@ -2360,7 +2484,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                 if extra_w >= 8 and mode == "NIST":
                     r_ = ratio(v[k])
                     bad = r_ is not None and (r_ > 3 or r_ < 1 / 3.0)
-                    vals.append((("%.2f" % r_) if r_ else "-",
+                    vals.append((("%.2f" % r_) if r_ else ("" if info["nist"] is None else "-"),
                                  curses.color_pair(LV_BASE + 1) if bad else curses.A_DIM))
                 if confw >= 6:
                     vals += [(up[0], curses.A_DIM), (lo[0], curses.A_DIM)]
@@ -2378,7 +2502,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                 put(win, 4, 2, "no %s lines%s" % (mode, why))
             summary = ("   %d with both values, median est/NIST %.2f" % (n_both, med)) if (med and mode == "NIST") else ""
 
-            put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s%s   t cut  s sort  a air/vac  Enter goto  q back" % (
+            put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s%s   t cut  s sort  a air/vac  v method  Enter goto  q back" % (
                 n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]], SORTS[st["sort"]], summary),
                 curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
@@ -2430,6 +2554,12 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
             st["msg"] = "sort: " + SORTS[st["sort"]] + ("  (worst agreement first)" if st["sort"] == 2 else "")
         elif c == "a":
             OPT["m1air"] = not OPT["m1air"]
+        elif c == "v" and n and relist:
+            key_ = (id(v[st["cur"]][2]), id(v[st["cur"]][3]), v[st["cur"]][1])
+            st["msg"], lines = relist(v[st["cur"]])
+            v = visible()
+            n_both, med, method_summary = stats()
+            st["cur"] = next((i_ for i_, t in enumerate(v) if (id(t[2]), id(t[3]), t[1]) == key_), st["cur"])
         elif c == ":":
             q = prompt(win, ":")
             if q is None:

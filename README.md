@@ -25,7 +25,8 @@ periodic
 - `↑` `↓` (also `j`/`k`) scroll, `u` changes energy units, and `c` turns colour coding on and off.
 - `f` cycles line tags: our [M1 estimates](#m1-lines-f-once), then our [E1 (allowed-line) estimates](#e1-allowed-lines-f-twice), then [NIST's values beside ours](#nist-transition-probabilities), then off.
 - `F` opens the full line list for the current tags; `Enter` there jumps to a line's upper level.
-- `e` expands the current level to show its other strong lines, and `E` expands every level.
+- `e` expands the current level to show its other strong lines, `m` shows more of them (and collapses again after 100%), and `E` expands every level.
+- `v` re-estimates the line under the cursor with the [next oscillator-strength method](#choosing-the-method-for-a-line-v), back round to its default.
 - `t` hides weaker lines, `a` switches between vacuum and air wavelengths, and `q` goes back.
 
 ## Features
@@ -125,7 +126,8 @@ Lists every ionization stage with its charge, electron count and isoelectronic s
 | `a` | Vacuum / air wavelengths |
 | `e` | Expand the level under the cursor: show its other lines as branch rows |
 | `E` | Expand all levels |
-| `m` | Expanded coverage: 95% → 99% → 100% of each level's rate |
+| `m` | Cycle the current level (every level, with `E` on) through off → 95% → 99% → 100% of its rate → off |
+| `v` | Re-estimate the line under the cursor (the level's main line, a branch row, or a row of the `F` list) with the next applicable method: `dn0` → `hyd` → `mix` → `f=1` → back to the default |
 | `r` | Refetch the levels from NIST ASD, bypassing the cache (the lines are refetched on the next visit to the NIST state) |
 | `q`, `Esc`, `:q`, `ZZ` | Back to the picker / table (`:qa` quits the app) |
 
@@ -168,7 +170,7 @@ which at $\lambda = 4\ \mu\mathrm{m}$, with $S/(2J_u+1) = 3f$, gives $1.26 \appr
 **Candidates** must satisfy all of:
 - parity changes
 - $\lvert \Delta J \rvert \le 1$, excluding $0 \to 0$
-- LS-allowed when both terms are LS: $\Delta S = 0$, $\lvert \Delta L \rvert \le 1$, no $S \to S$. Pairs with a non-LS term (jK, jj) are kept and marked `jj`.
+- LS-allowed when both terms are LS: $\Delta S = 0$, $\lvert \Delta L \rvert \le 1$, no $S \to S$. Pairs that break these rules are estimated separately through spin–orbit mixing ([`so` lines](#spinorbit-mixing-so), below). Pairs with a non-LS term (jK, jj) are kept and marked `jj`.
 - the two configurations differ by a single electron, $n_a l_a \leftarrow n_b l_b$, with $\lvert \Delta l \rvert = 1$
 
 **A-value.** The A-value is converted from an oscillator strength with the standard relation, as given in the [NIST Atomic Spectroscopy compendium](https://www.nist.gov/pml/atomic-spectroscopy-compendium-basic-ideas-notation-data-and-formulas/atomic-spectroscopy):
@@ -223,6 +225,31 @@ A `?` after the tag marks a d or f orbital with $n^{\ast 2} \le l(l+1)$, where t
 
 This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\times10^{8}$). In heavier ions, though, $ns\ np^{k+1}$ mixes strongly with $ns^2\ np^{k-1}\ nd$, and the two contributions cancel. That cancellation is beyond any hydrogenic estimate. For Se III $4s4p^3 \to 4s^2 4p^2$, the estimate is about $8\times10^{8}\ \mathrm{s^{-1}}$, against about $5\times10^{7}$ from multiconfiguration calculations. So `ci` lines are shown in the warning colour: treat them as an upper bound that may be an order of magnitude too high.
 
+#### Spin–orbit mixing (`so`)
+
+LS-forbidden lines (intercombination lines with $\Delta S \ne 0$, and $\lvert \Delta L \rvert = 2$ lines) become visible because spin–orbit interaction mixes a level with **partner** levels: levels of the same configuration and $J$ but a different term. The line borrows strength from a partner that has an LS-allowed line to the other end. The mixing is estimated from the level list itself, using a term's fine-structure width as a measure of the spin–orbit strength:
+
+```math
+\varepsilon_p \approx \frac{1}{2}\,\frac{W_\text{fs}}{\lvert E - E_p \rvert}, \qquad
+\varepsilon^2 = \min\!\Big(\tfrac{1}{2},\ \sum_{\text{partners}} \varepsilon_p^2 \Big),
+```
+
+where $W_\text{fs}$ is the larger fine-structure width (highest minus lowest level of the term) of the level's term and the partner's term. Partners at both ends of the line are summed. The A-value is then $\varepsilon^2$ times the line's estimate as if it were allowed (same hydrogenic $f$ and occupancy, with the upper level's decay shared over the lower configuration's levels in proportion to $2J_l+1$). These lines are tagged `so` in the warning colour, and mixing below $\varepsilon^2 = 10^{-8}$ is ignored.
+
+Checks: Mg I 4571 Å, Ca I 6573 Å and Hg I 2537 Å come out about 2× low; for W I, the 60 NIST intercombination and $\Delta L = 2$ lines that can be estimated come out a median 2.6× high, with 85% within a factor of 10.
+
+#### Choosing the method for a line (`v`)
+
+Each E1 line gets the method from the table above by default. `v` on a line steps it through the other methods that can be computed for it, in the order `dn0` → `hyd` → `mix` → `f=1`, and then back to its default:
+
+- `dn0` needs the ionization limit; `hyd` and `mix` need $\Delta n \ne 0$; `f=1` always applies. Methods that can't be computed for the line are skipped.
+- Only the oscillator strength changes. The occupancy factor, the 6j split, the `ci` binding and the `so` mixing factor $\varepsilon^2$ stay as they were, so `so` lines can be switched too.
+- An overridden line is tagged with `!` straight after the method (e.g. `dn0!?`), and the status line gives the new A and the methods available for that line. The lists re-sort, and the cursor stays on the line.
+- The choice applies everywhere the line appears in that ion's viewer: the level list, branch rows, the `F` list and the NIST comparison, including the per-method medians. Overrides last until you leave the level viewer.
+- M1 lines (one empirical formula only) and NIST lines with no estimate of ours can't be switched; `v` says so.
+
+**Unclassified levels.** Levels that NIST lists without a configuration (often just `*` for an odd level) can't be estimated, because the one-electron jump can't be identified. In W I these account for 401 of the 522 NIST lines with A-values, so the NIST state is the only source for those lines.
+
 **Typical accuracy** against reference values:
 - Lyα and Hα: exact
 - strong resonance lines (Na D, Ca II H & K, Mg II): within about 10%
@@ -231,6 +258,7 @@ This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\time
 
 **Known failures:**
 - `ci` lines (above): can be ~10× too high
+- LS-allowed lines in heavy, strongly mixed atoms: in W I the $5d^4 6s 6p \to 5d^4 6s^2$ lines come out a median ~12× too high, because configuration mixing redistributes their strength; compare with NIST where possible
 - alkali principal-series lines beyond the first, such as Na 3303 Å ($4p \to 3s$): about 35× too high, because a strong cancellation in the real radial integral has no hydrogenic counterpart
 - lines from a singlet upper level of $ns\ np \to ns^2$, such as Mg I 2852 Å: about 3–4× too low, because the strength of the whole configuration is spread over all upper terms, not concentrated by spin selection
 
@@ -240,15 +268,16 @@ NIST is only queried when you select the NIST state (`f` three times). That make
 
 - **The NIST state** lists every NIST line with an A-value. NIST's A (used for cuts, sorting and "strongest line") is shown with its accuracy grade, e.g. `N:B+`, followed by our estimate where we have one for the same pair of levels (`est -` where we don't) and the method that produced it: the E1 method tags (`dn0`, `hyd`, `mix`, `f=1`, with `ci`, `?`, `~` flags) or `emp` for the empirical M1 formula.
 - **NIST-only lines.** Lines our selection rules don't produce, such as intercombination, two-electron and E2/M2 lines, appear in the NIST list with an empty estimate column; NIST's `Type` column is shown.
+- **Estimate-only lines.** Our M1 and E1 estimates that NIST has no value for are also listed in the NIST state, with the NIST columns (A, grade, est/N) left blank; their estimate is used for cuts, sorting and "strongest line".
 - **The `F` list** shows `A_NIST`, the grade, `A_est`, the estimation method and `est/N` side by side, and its second line gives the median est/NIST ratio for each method (with the number of lines), which shows which approximations hold up for the ion. Ratios outside 1/3–3 are highlighted, and the status line gives the median est/NIST ratio for the ion. Sorting by worst agreement (`s` twice) brings the lines where the estimate fails most to the top.
 - **If NIST can't be reached,** the NIST state says so in the status line; the M1 and E1 states are unaffected.
 
 ### Where the tags appear
 
 - **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1, NIST), then λ and A. Next comes the source: the E1 method tag or `est` in the M1 and E1 states, or `N:<grade>` in the NIST state, which is followed by our estimate as `est …`. `+N` means N more lines from that upper level in the current list, above the current cut. It therefore differs between states: the E1 list contains different lines from the NIST list, and hides $A < 10^{6}\ \mathrm{s^{-1}}$ by default. In narrow windows the configuration column is hidden to make room, and the `est …` part may be cut off; the `F` list always shows both values.
-- **Expanded levels (`e`, `E`).** A level with `+N` can be expanded so its other lines hang below it as branch rows (`├→`, `└→`), with the same columns as the tag and in wavelength order. Together with the main (strongest) line they carry 95% of the level's total rate in the current list; the rest is summarised as `… k more lines, x% of the rate`, and `m` raises the coverage to 99% or 100%. `j`/`k` (and clicks) move through the branch rows as well, and the level being expanded is underlined while the cursor is on one of its branches. Collapsing a level while on one of its branches (`e`, turning off `E`, or a cut that removes the branch) puts the cursor back on that level. With `E` on, `e` folds just the current level and leaves the others expanded.
+- **Expanded levels (`e`, `E`).** A level with `+N` can be expanded so its other lines hang below it as branch rows (`├→`, `└→`), with the same columns as the tag and in wavelength order. Together with the main (strongest) line they carry 95% of the level's total rate in the current list; the rest is summarised as `… k more lines, x% of the rate`. `m` steps through off → 95% → 99% → 100% → off, so it can be used on its own without `e`. `j`/`k` (and clicks) move through the branch rows as well, and the level being expanded is underlined while the cursor is on one of its branches. Collapsing a level while on one of its branches (`e`, turning off `E`, or a cut that removes the branch) puts the cursor back on that level. With `E` on, `e` folds just the current level and leaves the others expanded.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
-- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`.
+- **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`. A `!` after the method marks one you chose with `v`.
 - **Wavelength units.** Vacuum by default. Allowed (E1) lines, in the E1 state and E1-type lines in the NIST state, are given in nm (µm beyond 10 µm). M1 and other forbidden lines use Å below 1 µm and µm above.
 - **Air wavelengths** (`a`) use the refractive-index formula of [Morton (2000), ApJS 130, 403](https://doi.org/10.1086/317349) above 2000 Å.
 
