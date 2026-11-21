@@ -4,6 +4,30 @@ A vim-inspired periodic table and [NIST Atomic Spectra Database (ASD)](https://p
 
 This is completely vibecoded. By design, I have not looked at any of the code by hand.
 
+## Quick start
+
+```bash
+periodic
+```
+
+(See [Usage](#usage) for installing it on your `PATH`.)
+
+**On the periodic table**
+
+- The arrow keys `←` `↓` `↑` `→` (also `h` `j` `k` `l`) move around the table, and the mouse works too: click to select, double-click to open.
+- `Enter` opens an element's ionization stages; pick one with `↑` `↓` (also `j`/`k`) and `Enter` to see its energy levels.
+- `/` searches by symbol, name or atomic number, and `n`/`N` jump between matches.
+- `c` highlights each element category in turn, and `Esc` clears it.
+- `?` shows every key, and `q` or `:q` quits.
+
+**In the energy-level list**
+
+- `↑` `↓` (also `j`/`k`) scroll, `u` changes energy units, and `c` turns colour coding on and off.
+- `f` cycles line tags: our [M1 estimates](#m1-lines-f-once), then our [E1 (allowed-line) estimates](#e1-allowed-lines-f-twice), then [NIST's values beside ours](#nist-transition-probabilities), then off.
+- `F` opens the full line list for the current tags; `Enter` there jumps to a line's upper level.
+- `e` expands the current level to show its other strong lines, and `E` expands every level.
+- `t` hides weaker lines, `a` switches between vacuum and air wavelengths, and `q` goes back.
+
 ## Features
 
 - **Full 118-element table** with categories, ground-state electron configurations (including the common exceptions), block/group/period metadata, and lanthanide/actinide placement.
