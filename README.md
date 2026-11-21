@@ -99,6 +99,9 @@ Lists every ionization stage with its charge, electron count and isoelectronic s
 | `s` (in the `F` list) | Cycle sort: A, wavelength; in the NIST list also worst estimate-vs-NIST agreement first |
 | `t` | Cycle the minimum A-value shown |
 | `a` | Vacuum / air wavelengths |
+| `e` | Expand the level under the cursor: show its other lines as branch rows |
+| `E` | Expand all levels |
+| `m` | Expanded coverage: 95% → 99% → 100% of each level's rate |
 | `r` | Refetch the levels from NIST ASD, bypassing the cache (the lines are refetched on the next visit to the NIST state) |
 | `q`, `Esc`, `:q`, `ZZ` | Back to the picker / table (`:qa` quits the app) |
 
@@ -211,14 +214,15 @@ This brings C II 1335.7 Å to $2.8\times10^{8}\ \mathrm{s^{-1}}$ (NIST $2.9\time
 
 NIST is only queried when you select the NIST state (`f` three times). That makes one request per ion for NIST ASD's lines with transition probabilities (allowed and forbidden), cached like the levels. `PERIODIC_LINES_DIR` is checked first for files named `lines_<El>+<charge>.txt`. The M1 and E1 states show our estimates only: they never touch the network or NIST data on disk. After `r`, the next visit to the NIST state refetches the lines. Each NIST line is matched to the level list by upper and lower energy and J, to within about 0.05 cm⁻¹; configuration and term strings aren't relied on.
 
-- **The NIST state** lists every NIST line with an A-value. NIST's A (used for cuts, sorting and "strongest line") is shown with its accuracy grade, e.g. `N:B+`, followed by our estimate where we have one for the same pair of levels (`est -` where we don't).
+- **The NIST state** lists every NIST line with an A-value. NIST's A (used for cuts, sorting and "strongest line") is shown with its accuracy grade, e.g. `N:B+`, followed by our estimate where we have one for the same pair of levels (`est -` where we don't) and the method that produced it: the E1 method tags (`dn0`, `hyd`, `mix`, `f=1`, with `ci`, `?`, `~` flags) or `emp` for the empirical M1 formula.
 - **NIST-only lines.** Lines our selection rules don't produce, such as intercombination, two-electron and E2/M2 lines, appear in the NIST list with an empty estimate column; NIST's `Type` column is shown.
-- **The `F` list** shows `A_NIST`, the grade, `A_est` and `est/N` side by side. Ratios outside 1/3–3 are highlighted, and the status line gives the median est/NIST ratio for the ion. Sorting by worst agreement (`s` twice) brings the lines where the estimate fails most to the top.
+- **The `F` list** shows `A_NIST`, the grade, `A_est`, the estimation method and `est/N` side by side, and its second line gives the median est/NIST ratio for each method (with the number of lines), which shows which approximations hold up for the ion. Ratios outside 1/3–3 are highlighted, and the status line gives the median est/NIST ratio for the ion. Sorting by worst agreement (`s` twice) brings the lines where the estimate fails most to the top.
 - **If NIST can't be reached,** the NIST state says so in the status line; the M1 and E1 states are unaffected.
 
 ### Where the tags appear
 
 - **Level list.** With tags on, each upper level shows its strongest line: the lower J (M1) or the lower level's row number `→#n` (E1, NIST), then λ and A. Next comes the source: the E1 method tag or `est` in the M1 and E1 states, or `N:<grade>` in the NIST state, which is followed by our estimate as `est …`. `+N` means N more lines from that upper level in the current list, above the current cut. It therefore differs between states: the E1 list contains different lines from the NIST list, and hides $A < 10^{6}\ \mathrm{s^{-1}}$ by default. In narrow windows the configuration column is hidden to make room, and the `est …` part may be cut off; the `F` list always shows both values.
+- **Expanded levels (`e`, `E`).** A level with `+N` can be expanded so its other lines hang below it as branch rows (`├→`, `└→`), with the same columns as the tag and in wavelength order. Together with the main (strongest) line they carry 95% of the level's total rate in the current list; the rest is summarised as `… k more lines, x% of the rate`, and `m` raises the coverage to 99% or 100%. `j`/`k` (and clicks) move through the branch rows as well, and the level being expanded is underlined while the cursor is on one of its branches. Collapsing a level while on one of its branches (`e`, turning off `E`, or a cut that removes the branch) puts the cursor back on that level. With `E` on, `e` folds just the current level and leaves the others expanded.
 - **`F` list.** Every line, strongest first, sortable by wavelength (`s`). `Enter` jumps to the upper level.
 - **Colours.** Wavelengths are coloured like the photon (infrared dim red, ultraviolet dim violet), and A-values by strength. Method tags are green when a hydrogenic estimate was used (`dn0`, `hyd`, `mix`), yellow when the value was capped, and red for `?` and `ci`.
 - **Wavelength units.** Vacuum by default. Allowed (E1) lines, in the E1 state and E1-type lines in the NIST state, are given in nm (µm beyond 10 µm). M1 and other forbidden lines use Å below 1 µm and µm above.

@@ -396,7 +396,8 @@ OPT = {"opacity": _env_int("PERIODIC_OPACITY", 70), "light": detect_light(),
        "aspect": _env_float("PERIODIC_ASPECT", 2.0, 1.0, 3.0),
        "space": os.environ.get("PERIODIC_SPACING", "1") not in ("0", "off", "no"),
        "lite": os.environ.get("PERIODIC_LITE", "0") not in ("0", "", "off", "no"),
-       "cut": {"M1": 0, "E1": 3, "NIST": 0}, "m1air": False}
+       "cut": {"M1": 0, "E1": 3, "NIST": 0}, "m1air": False, "exp_frac": 0.95}
+EXP_FRACS = (0.95, 0.99, 1.0)
 
 
 def input_pending(win):
@@ -644,6 +645,10 @@ VHELP = [
     "F                  full list for the current mode (NIST: A_NIST, grade, A_est, est/NIST)",
     "                   s cycles sort: A / wavelength (/ worst est-vs-NIST agreement first)",
     "t / a              cycle minimum A shown / air vs vacuum wavelengths",
+    "e / E              expand the current level / all levels: branch rows for the lines that",
+    "                   carry 95% of the level's rate (in this list), in wavelength order;",
+    "                   j/k step through branch rows too; collapsing returns to the level",
+    "m                  expanded coverage: 95% -> 99% -> 100% of the rate",
     "o                  toggle energy-sorted / NIST order",
     "r                  refetch levels and lines from NIST (skip the cache)",
     "click row / header (header cycles units), wheel scrolls",
@@ -1030,7 +1035,7 @@ def fmt_lam(lam, air, nm=False):
     return "%9.2f cm" % (lam / 1.0e8)
 
 
-TAGW = (6, LAMW, 9, 6, 3, 9)   # level-list tag columns: ->target, wavelength, A, source, +N, est
+TAGW = (6, LAMW, 9, 6, 3, 9, 7)   # level-list tag columns: ->target, wavelength, A, source, +N, est, method
 
 
 def tag_header(mode):
@@ -1040,7 +1045,8 @@ def tag_header(mode):
               ("A_NIST" if mode == "NIST" else "A_est", ">"),
               ("grade" if mode == "NIST" else ("method" if mode == "E1" else ""), "<"),
               ("+N", "<"),
-              ("A_est" if mode == "NIST" else "", ">")]
+              ("A_est" if mode == "NIST" else "", ">"),
+              ("method" if mode == "NIST" else "", "<")]
     return "".join(fit(t, w, a) + " " for (t, a), w in zip(labels, TAGW)).rstrip()
 
 
@@ -1580,7 +1586,9 @@ def merge_lines(est, nist, mode):
         emap = {(id(t[2]), id(t[3])): t for t in est}
         for key, d in nmap.items():
             e = emap.get(key)
-            info = {"est": e[0] if e else None, "nist": d["A"], "acc": d["acc"], "type": d["type"]}
+            method = (e[6] if isinstance(e[6], str) else "emp") if e else ""
+            info = {"est": e[0] if e else None, "nist": d["A"], "acc": d["acc"], "type": d["type"],
+                    "method": method}
             out.append((d["A"], d["lam"], d["up"], d["lo"], d["Ju"], d["Jl"], d["type"], info))
     else:
         for t in est:
@@ -1747,7 +1755,8 @@ def stage_picker(win, z):
 def levels_view(win, sym, stage, rows, source, err, force_lines=False):
     """Scrollable level table. -> 'close', 'quit' or 'refresh'."""
     st = {"cur": 0, "count": "", "pend": "", "msg": "", "unit": 0, "sort": True, "q": "",
-          "col": not OPT["lite"], "mode": None}
+          "col": not OPT["lite"], "mode": None, "exp": set(), "expall": False,
+          "sub": None, "sub_owner": None}
     linecache, upcache, estcache = {}, {}, {}
     nst = {"recs": None, "err": None, "src": "", "have": False, "net_tried": False}
 
@@ -1819,6 +1828,52 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
     view = sorted(rows, key=lambda r: r[3])
     top = 0
 
+    def tag_parts(line, mode, vidx, plus):
+        """Column pieces for one line tag: (text, width, align, attr).  `plus` is the +N text."""
+        A_, lam_, _, lo_, _, Jl_, tag_, info_ = line
+        if mode == "M1":
+            tgt = fmt_J(Jl_)
+        else:
+            tgt = "#%d" % (vidx[id(lo_)] + 1) if id(lo_) in vidx else fmt_J(Jl_) or "?"
+        kind_ = line_kind(info_, mode)
+        if info_["nist"] is not None:
+            src_txt, src_attr = "N:" + (info_["acc"] or "?"), curses.color_pair(LV_EVEN) | curses.A_BOLD
+        elif mode == "E1":
+            src_txt, src_attr = tag_, method_attr(tag_)
+        else:
+            src_txt, src_attr = "est", curses.A_DIM
+        est_txt, meth_txt, meth_attr = "", "", curses.A_DIM
+        if mode == "NIST":
+            est_txt = ("%9.2e" % info_["est"]) if info_["est"] else fit("-", 9, ">")
+            meth_txt = info_.get("method", "")
+            meth_attr = method_attr(meth_txt) if meth_txt and meth_txt != "emp" else curses.A_DIM
+        return [("\u2192" + tgt, TAGW[0], "<", curses.A_BOLD),
+                (fmt_lam(lam_, OPT["m1air"], kind_ == "E1"), TAGW[1], "<", lam_attr(lam_)),
+                ("%9.2e" % A_, TAGW[2], ">", a_attr(A_, kind_)),
+                (src_txt, TAGW[3], "<", src_attr),
+                (plus, TAGW[4], "<", curses.A_DIM),
+                (est_txt, TAGW[5], ">", curses.A_DIM),
+                (meth_txt, TAGW[6], "<", meth_attr)]
+
+    def branches(lines_here):
+        """Expanded rows for one level: the lines (beyond the main, strongest one) that together
+        with it carry OPT['exp_frac'] of the level's total rate in this list, in wavelength order,
+        then a 'more' row for whatever is left."""
+        if not lines_here or len(lines_here) < 2:
+            return []
+        total = sum(t[0] for t in lines_here)
+        acc, keep = 0.0, 0
+        for t in lines_here:                      # strongest first
+            acc += t[0]
+            keep += 1
+            if acc >= OPT["exp_frac"] * total - 1e-30:
+                break
+        out = [("line", t) for t in sorted(lines_here[1:keep], key=lambda t: t[1])]
+        rest = lines_here[keep:]
+        if rest:
+            out.append(("more", len(rest), sum(t[0] for t in rest) / total))
+        return out
+
     def hit(r):
         return bool(st["q"]) and st["q"] in (r[0] + " " + r[1]).lower()
 
@@ -1836,10 +1891,6 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
         page = max(1, h - 4)
         n = len(view)
         st["cur"] = max(0, min(st["cur"], n - 1)) if n else 0
-        if st["cur"] < top:
-            top = st["cur"]
-        if st["cur"] >= top + page:
-            top = st["cur"] - page + 1
         uname = UNITS[st["unit"]][0]
         mode = st["mode"]
         annw = sum(TAGW) + len(TAGW) + 2 if mode else 0
@@ -1848,6 +1899,27 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
         confw = 0 if narrow else max(10, min(60, w - 43 - annw))
         m1map = by_upper(mode) if mode else {}
         vidx = {id(r_): i_ for i_, r_ in enumerate(view)} if mode in ("E1", "NIST") else {}
+        # display rows: each level, followed by its branch rows when expanded
+        disp, lpos = [], {}
+        for k_ in range(n):
+            lpos[k_] = len(disp)
+            disp.append((k_, None, None))
+            if mode and (st["expall"] or id(view[k_]) in st["exp"]):
+                disp.extend((k_, b_, bi_) for bi_, b_ in enumerate(branches(m1map.get(id(view[k_])))))
+        cur_d = 0
+        if n:
+            nbr = (lpos[st["cur"] + 1] if st["cur"] + 1 < n else len(disp)) - lpos[st["cur"]] - 1
+            # on a branch that no longer exists (collapsed, cut raised, cursor moved): back to its level
+            if st["sub"] is not None and (st["sub_owner"] != st["cur"] or st["sub"] >= nbr):
+                st["sub"] = None
+            cur_d = lpos[st["cur"]] + (st["sub"] + 1 if st["sub"] is not None else 0)
+            end_d = cur_d if st["sub"] is not None else lpos[st["cur"]] + nbr   # keep branches in view
+            if cur_d < top:
+                top = cur_d
+            if end_d >= top + page:
+                top = max(0, min(cur_d, end_d - page + 1))
+            top = max(0, min(top, max(0, len(disp) - 1)))
+        basew = 6 + ((confw + 1) if confw else 0) + (termw + 1) + 7 + ew    # width of the level columns
 
         if throttle.should_draw(win):
             win.erase()
@@ -1867,43 +1939,42 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                     put(win, 0, lx, txt, a)
                     lx += len(txt) + (0 if txt == "█" else 1)
             for i in range(page):
-                k = top + i
-                if k >= n:
+                d_ = top + i
+                if d_ >= len(disp):
                     break
+                k, br, bi = disp[d_]
+                y = 2 + i
+                if br is not None:                  # a branch row hanging off level k
+                    last_ = d_ + 1 >= len(disp) or disp[d_ + 1][1] is None
+                    on_ = k == st["cur"] and st["sub"] == bi
+                    x_ = 1 + basew + 2
+                    put(win, y, x_ - 1, "\u2514" if last_ else "\u251c", curses.A_DIM)
+                    if br[0] == "line":
+                        for txt_, wd_, al_, at_ in tag_parts(br[1], mode, vidx, ""):
+                            put(win, y, x_, fit(txt_, wd_, al_) + " ", curses.A_REVERSE if on_ else at_)
+                            x_ += wd_ + 1
+                    else:
+                        put(win, y, x_, "\u2026 %d more line%s, %.1f%% of the rate  (m: show more)" % (
+                            br[1], "" if br[1] == 1 else "s", 100 * br[2]),
+                            curses.A_REVERSE if on_ else curses.A_DIM)
+                    continue
                 conf, term, j, e, flag = view[k]
                 cells = ["%5d " % (k + 1), ("%-*s " % (confw, conf[:confw])) if confw else "",
                          "%-*s " % (termw, term[:termw]), "%-6s " % j[:6], "%*s" % (ew, fmt_e(e, st["unit"], flag))]
-                y = 2 + i
                 lines_here = m1map.get(id(view[k])) if mode else None
                 if lines_here:
-                    A_, lam_, _, lo_, _, Jl_, tag_, info_ = lines_here[0]
-                    on = k == st["cur"]
-                    if mode == "M1":
-                        tgt = fmt_J(Jl_)
-                    else:
-                        tgt = "#%d" % (vidx[id(lo_)] + 1) if id(lo_) in vidx else fmt_J(Jl_) or "?"
-                    kind_ = line_kind(info_, mode)
-                    if info_["nist"] is not None:
-                        src_txt, src_attr = "N:" + (info_["acc"] or "?"), curses.color_pair(LV_EVEN) | curses.A_BOLD
-                    elif mode == "E1":
-                        src_txt, src_attr = tag_, method_attr(tag_)
-                    else:
-                        src_txt, src_attr = "est", curses.A_DIM
-                    est_txt = ""
-                    if mode == "NIST":
-                        est_txt = ("%9.2e" % info_["est"]) if info_["est"] else fit("-", 9, ">")
-                    parts = [("\u2192" + tgt, TAGW[0], "<", curses.A_BOLD),
-                             (fmt_lam(lam_, OPT["m1air"], kind_ == "E1"), TAGW[1], "<", lam_attr(lam_)),
-                             ("%9.2e" % A_, TAGW[2], ">", a_attr(A_, kind_)),
-                             (src_txt, TAGW[3], "<", src_attr),
-                             (("+%d" % (len(lines_here) - 1)) if len(lines_here) > 1 else "", TAGW[4], "<", curses.A_DIM),
-                             (est_txt, TAGW[5], ">", curses.A_DIM)]
+                    on = k == st["cur"] and st["sub"] is None
+                    plus = ("+%d" % (len(lines_here) - 1)) if len(lines_here) > 1 else ""
                     x_ = 1 + len("".join(cells)) + 2
-                    for txt_, wd_, al_, at_ in parts:
+                    for txt_, wd_, al_, at_ in tag_parts(lines_here[0], mode, vidx, plus):
                         put(win, y, x_, fit(txt_, wd_, al_) + " ", curses.A_REVERSE if on else at_)
                         x_ += wd_ + 1
-                if k == st["cur"] or not st["col"]:
-                    attr = curses.A_REVERSE if k == st["cur"] else (curses.A_BOLD if hit(view[k]) else 0)
+                on_lvl = k == st["cur"] and st["sub"] is None
+                parent_of_cursor = k == st["cur"] and st["sub"] is not None
+                if on_lvl or parent_of_cursor or not st["col"]:
+                    attr = curses.A_REVERSE if on_lvl else (
+                        curses.A_BOLD | curses.A_UNDERLINE if parent_of_cursor else
+                        (curses.A_BOLD if hit(view[k]) else 0))
                     put(win, y, 1, "".join(cells), attr)
                     continue
                 extra = curses.A_BOLD | curses.A_UNDERLINE if hit(view[k]) else 0
@@ -1926,6 +1997,9 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 + ("   %s: %d lines, A ≥ %g%s  (f next  F list  t cut  a air/vac)" % (
                     mode, sum(len(v) for v in m1map.values()), MODES[mode]["cuts"][OPT["cut"][mode]],
                     ("  " + nist_status(nst)) if mode == "NIST" else "  estimates")
+                   + (("  expanded: %s, %d%% of rate (e/E, m)" % ("all" if st["expall"] else "%d" % len(st["exp"]),
+                                                                     round(100 * OPT["exp_frac"])))
+                      if (st["expall"] or st["exp"]) else "")
                    if mode else ""),
                 curses.A_DIM)
             put(win, h - 1, 1, st["msg"])
@@ -1947,8 +2021,9 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                     st["cur"] = min(n - 1, st["cur"] + 3)
                 elif my == 1:
                     st["unit"] = (st["unit"] + 1) % len(UNITS)
-                elif 0 <= my - 2 < page and top + my - 2 < n:
-                    st["cur"] = top + my - 2
+                elif 0 <= my - 2 < page and top + my - 2 < len(disp):
+                    st["cur"], _, st["sub"] = disp[top + my - 2]
+                    st["sub_owner"] = st["cur"]
             continue
         c = chr(ch) if 0 <= ch < 256 else ""
         if st["pend"] == "Z":
@@ -1961,6 +2036,13 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 st["count"] = st["pend"] = st["q"] = ""
                 continue
             return "close"
+        if n and len(disp) > n and not st["pend"] and (c in ("j", "k") or ch in (curses.KEY_DOWN, curses.KEY_UP)):
+            cnt = int(st["count"]) if st["count"] else 1
+            st["count"] = ""
+            d_ = max(0, min(len(disp) - 1, cur_d + (cnt if (c == "j" or ch == curses.KEY_DOWN) else -cnt)))
+            st["cur"], _, st["sub"] = disp[d_]
+            st["sub_owner"] = st["cur"]
+            continue
         if list_nav(st, ch, c, n, page):
             continue
         st["count"] = ""
@@ -2000,6 +2082,31 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
                 st["cur"] = view.index(res[1])
                 st["mode"] = res[2]
             win.clear()
+        elif c in ("e", "E", "m") and not st["mode"]:
+            st["msg"] = "turn on line tags with f first"
+        elif c == "e" and n:
+            key_ = id(view[st["cur"]])
+            lh_ = m1map.get(key_) or []
+            if st["expall"]:                     # leave everything else expanded, fold just this level
+                st["expall"] = False
+                st["exp"] = {id(r_) for r_ in view if len(m1map.get(id(r_)) or []) > 1} - {key_}
+                st["sub"] = None
+            elif key_ in st["exp"]:
+                st["exp"].discard(key_)
+                st["sub"] = None
+            elif len(lh_) < 2:
+                st["msg"] = "only one line from this level" if lh_ else "no lines from this level"
+            else:
+                st["exp"].add(key_)
+        elif c == "E":
+            st["expall"] = not st["expall"]
+            if not st["expall"]:
+                st["exp"].clear()
+            st["msg"] = "expand all " + ("on" if st["expall"] else "off")
+        elif c == "m":
+            i_ = EXP_FRACS.index(OPT["exp_frac"]) if OPT["exp_frac"] in EXP_FRACS else 0
+            OPT["exp_frac"] = EXP_FRACS[(i_ + 1) % len(EXP_FRACS)]
+            st["msg"] = "expanded lines cover %d%% of each level's rate" % round(100 * OPT["exp_frac"])
         elif c == "t" and st["mode"]:
             md = st["mode"]
             OPT["cut"][md] = (OPT["cut"][md] + 1) % len(MODES[md]["cuts"])
@@ -2065,6 +2172,13 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
     n_both = sum(1 for t in lines if t[7]["est"] and t[7]["nist"])
     rs = sorted(math.log10(ratio(t)) for t in lines if ratio(t))
     med = (10 ** rs[len(rs) // 2]) if rs else None
+    by_method = {}
+    for t in lines:
+        if ratio(t):
+            base = (t[7].get("method") or "").split()[0].rstrip("?~") or "?"
+            by_method.setdefault(base, []).append(math.log10(ratio(t)))
+    method_summary = "  ".join("%s %.2f (%d)" % (k_, 10 ** sorted(v_)[len(v_) // 2], len(v_))
+                               for k_, v_ in sorted(by_method.items(), key=lambda kv: -len(kv[1])))
     while True:
         h, w = win.getmaxyx()
         page = max(1, h - 5)
@@ -2076,20 +2190,27 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
             top = st["cur"] - page + 1
         lamh = "λ_" + ("air" if OPT["m1air"] else "vac")
         lastw = 7 if mode != "NIST" else 6
-        extra_w = max(0, w - 2 - (79 if mode == "NIST" else 65))
+        extra_w = max(0, w - 2 - (87 if mode == "NIST" else 65))
         confw = max(0, min(30, (extra_w - 8) // 2))
         if throttle.should_draw(win):
             win.erase()
             put(win, 0, 1, "%s %s  %s" % (sym, roman(stage), M["title"]), curses.A_BOLD)
             nist_note = ("   " + nist_status(nst)) if nst is not None else ""
-            put(win, 1, 1, M["formula"] + nist_note, curses.A_DIM)
+            if mode == "NIST" and nst is not None:
+                line1 = nist_status(nst) + (("    median est/NIST by method:  " + method_summary) if method_summary else "")
+            else:
+                line1 = M["formula"] + nist_note
+            put(win, 1, 1, line1[:w - 2], curses.A_DIM)
             last = {"M1": "f", "E1": "method", "NIST": "type"}[mode]
             # column spec: (header, width, align); rows below use exactly the same widths
             spec = [("#", 4, ">"), ("upper", 8, "<"), ("J", 5, "<"), ("", 1, "<"), ("lower", 8, "<"), ("J", 5, "<"),
                     (lamh, LAMW, ">")]
             if mode == "NIST":
                 spec += [("A_NIST", 9, ">"), ("acc", 3, "<")]
-            spec += [("A_est", 9, ">"), (last, lastw, "<")]
+            spec += [("A_est", 9, ">")]
+            if mode == "NIST":
+                spec += [("method", 7, "<")]
+            spec += [(last, lastw, "<")]
             if extra_w >= 8 and mode == "NIST":
                 spec += [("est/N", 6, ">")]
             if confw >= 6:
@@ -2119,8 +2240,11 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                               a_attr(info["nist"], kind) if info["nist"] is not None else curses.A_DIM),
                              (info["acc"] or "", curses.color_pair(LV_EVEN))]
                 vals += [(("%.2e" % info["est"]) if info["est"] else "-",
-                          a_attr(info["est"], kind) if info["est"] else curses.A_DIM),
-                         (last_txt, last_attr)]
+                          a_attr(info["est"], kind) if info["est"] else curses.A_DIM)]
+                if mode == "NIST":
+                    mt_ = info.get("method", "")
+                    vals += [(mt_ or "-", method_attr(mt_) if mt_ and mt_ != "emp" else curses.A_DIM)]
+                vals += [(last_txt, last_attr)]
                 if extra_w >= 8 and mode == "NIST":
                     r_ = ratio(v[k])
                     bad = r_ is not None and (r_ > 3 or r_ < 1 / 3.0)
@@ -2141,6 +2265,7 @@ def lines_view(win, sym, stage, lines, mode, nst=None):
                     if mode == "E1" else ": NIST has no transition probabilities for this ion, or they could not be fetched")
                 put(win, 4, 2, "no %s lines%s" % (mode, why))
             summary = ("   %d with both values, median est/NIST %.2f" % (n_both, med)) if (med and mode == "NIST") else ""
+
             put(win, h - 2, 1, "%d lines  [%d/%d]  A ≥ %g  sort: %s%s   t cut  s sort  a air/vac  Enter goto  q back" % (
                 n, st["cur"] + 1 if n else 0, n, M["cuts"][OPT["cut"][mode]], SORTS[st["sort"]], summary),
                 curses.A_DIM)
