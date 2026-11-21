@@ -640,6 +640,7 @@ VHELP = [
     "                   E1: one-electron LS-allowed lines, hydrogenic f estimates",
     "                   method tag: dn0 same-shell, hyd exact hydrogenic, mix blend of the two,",
     "                   f=1 capped, ? penetrating d/f orbital; strength split by LS 6j,",
+    "                   so = LS-forbidden line (dS != 0 or dL = 2) borrowing strength via spin-orbit mixing,",
     "                   ~ = no stated parent, so lower terms share by (2L+1)(2S+1)",
     "                   ci: ns np^(k+1) -> ns2 np^k type, often much weaker (configuration mixing)",
     "F                  full list for the current mode (NIST: A_NIST, grade, A_est, est/NIST)",
@@ -648,7 +649,7 @@ VHELP = [
     "e / E              expand the current level / all levels: branch rows for the lines that",
     "                   carry 95% of the level's rate (in this list), in wavelength order;",
     "                   j/k step through branch rows too; collapsing returns to the level",
-    "m                  expanded coverage: 95% -> 99% -> 100% of the rate",
+    "m                  cycle the current level (all, with E): off -> 95% -> 99% -> 100% -> off",
     "o                  toggle energy-sorted / NIST order",
     "r                  refetch levels and lines from NIST (skip the cache)",
     "click row / header (header cycles units), wheel scrolls",
@@ -794,13 +795,20 @@ def _parse_levels(text):
         pre = get("pre")
         flag = pre[:1] if pre[:1] in ("[", "(") else (lev[:1] if lev[:1] in ("[", "(") else "")
         conf, term = get("conf"), get("term")
-        blank_conf = not conf
-        if blank_conf:
-            conf = prev_conf          # grouped output leaves repeats blank
-            if not term:
-                term = prev_term
-        prev_conf, prev_term = conf, term
         rows.append((conf, term, get("j"), float(m.group()), flag))
+    # Multiplet-ordered output writes a term's configuration and label once and leaves the
+    # following rows of that term blank; energy-ordered output repeats them on every row, and
+    # there a blank row is an undesignated level.  Inherit only in the first case, and never into
+    # rows that carry a term of their own (e.g. a bare '*' = unclassified odd level).
+    repeats = any(a[0] and a[0] == b[0] and a[1] and a[1] == b[1] for a, b in zip(rows, rows[1:]))
+    if not repeats:
+        out, prev = [], ("", "")
+        for r in rows:
+            if not r[0] and not r[1]:
+                r = (prev[0], prev[1]) + r[2:]
+            prev = (r[0], r[1])
+            out.append(r)
+        rows = out
     return rows
 
 
@@ -1067,7 +1075,7 @@ def lam_attr(lam):
 
 def method_attr(tag):
     """dn0/hyd/mix: hydrogenic estimate used; f=1: capped; ci or ?: treat with care."""
-    if "?" in tag or "ci" in tag:
+    if "?" in tag or "ci" in tag or tag.endswith(" so"):
         return curses.color_pair(LV_BASE + 1)                  # red-ish: treat with care
     if tag.startswith(("dn0", "hyd", "mix")):
         return curses.color_pair(LV_BASE + 2)                  # green
@@ -1284,6 +1292,88 @@ def e1_A(lam_A, Ju, Jl, f=1.0):
     return 6.670e15 * (2 * Jl + 1) / (2 * Ju + 1) * f / lam_A ** 2
 
 
+SO_C = 0.5          # epsilon = SO_C * (fine-structure width) / (distance to the partner level)
+SO_CAP = 0.5        # full mixing
+SO_MIN = 1e-8       # below this the borrowed line is ~1e-8 of an allowed one: not listed
+
+
+def _ls_allowed(a, b):
+    (La, Sa), (Lb, Sb) = a, b
+    return abs(Sa - Sb) < 1e-9 and abs(La - Lb) <= 1 + 1e-9 and not (La == 0 and Lb == 0)
+
+
+def _so_lines(terms, so_pairs, elim, zeta):
+    """LS-forbidden E1 lines (dS != 0 and/or |dL| = 2) made visible by spin-orbit mixing.
+    A level mixes with 'partner' levels of the same configuration and J but another term; the
+    line borrows strength from a partner that has an LS-allowed line to the other end:
+        epsilon = SO_C * W / |E - E_partner|,  W = larger fine-structure width of the two terms
+        eps2    = sum over partners at both ends, capped at SO_CAP
+        A       = eps2 * (the line estimated as if allowed: hydrogenic f, occupancy, and the
+                  upper level's decay shared over the lower configuration's levels by (2J_l+1))
+    Tagged 'so'.  Order-of-magnitude, like the other estimators."""
+    if not so_pairs:
+        return []
+    width, byCJ = {}, {}
+    for k, t in terms.items():
+        es = [r[3] for r, _ in t["levels"]]
+        width[k] = max(es) - min(es)
+        for r, J in t["levels"]:
+            byCJ.setdefault((k[0], round(2 * J)), []).append((k, r))
+    lowJ = {}                                 # (lower configuration, 2J_u) -> sum of (2J_l+1)
+    for k, t in terms.items():
+        for _, J in t["levels"]:
+            for d in (-2, 0, 2):
+                key = (k[0], round(2 * J) + d)
+                lowJ[key] = lowJ.get(key, 0.0) + 2 * J + 1
+
+    e2cache = {}
+
+    def eps2(r, J, own, other):
+        key = (id(r), own, other)
+        if key in e2cache:
+            return e2cache[key]
+        tot = 0.0
+        for pk, pr in byCJ.get((own[0], round(2 * J)), ()):
+            if pk == own or not terms[pk]["LS"] or not _ls_allowed(terms[pk]["LS"], terms[other]["LS"]):
+                continue
+            Wfs, dE = max(width[own], width[pk]), abs(r[3] - pr[3])
+            if Wfs > 0 and dE > 0:
+                tot += (SO_C * Wfs / dE) ** 2
+        e2cache[key] = tot
+        return tot
+
+    out, fcache = [], {}
+    ebar = {k: sum(r[3] for r, _ in t["levels"]) / len(t["levels"]) for k, t in terms.items()}
+    for k1, k2, (in2, in1) in so_pairs:
+        t1, t2 = terms[k1], terms[k2]
+        for r1, J1 in t1["levels"]:
+            for r2, J2 in t2["levels"]:
+                if abs(J1 - J2) > 1 + 1e-9 or (J1 == 0 and J2 == 0) or r1[3] == r2[3]:
+                    continue
+                if r1[3] > r2[3]:
+                    up, Ju, ku, lo, Jl, kl, ka, kb = r1, J1, k1, r2, J2, k2, in2, in1
+                else:
+                    up, Ju, ku, lo, Jl, kl, ka, kb = r2, J2, k2, r1, J1, k1, in1, in2
+                e2 = min(SO_CAP, eps2(up, Ju, ku, kl) + eps2(lo, Jl, kl, ku))
+                if e2 < SO_MIN:               # negligible mixing: no visible line
+                    continue
+                tu, tl = terms[ku], terms[kl]
+                if (ku, kl) not in fcache:       # one f per pair of terms (term-averaged energies)
+                    inner = tl["occ"].get(kb, 0) > 0
+                    eu, el = max(ebar[ku], ebar[kl]), min(ebar[ku], ebar[kl])
+                    fcache[(ku, kl)] = f_hydrogenic(ka, kb, el, eu, elim, zeta, inner) if eu > el else (0.0, "")
+                f, tag = fcache[(ku, kl)]
+                cap_a = 2 * (2 * ka[1] + 1)
+                occ = tu["occ"].get(kb, 1) * max(0, cap_a - tu["occ"].get(ka, 0)) / cap_a
+                share = (2 * Jl + 1) / lowJ.get((kl[0], round(2 * Ju)), 2 * Jl + 1)
+                if occ <= 0 or f <= 0:
+                    continue
+                lam = 1.0e8 / (up[3] - lo[3])
+                A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * share * e2
+                out.append((A, lam, up, lo, Ju, Jl, tag + " so"))
+    return out
+
+
 def e1_lines(rows, stage=1):
     """Candidate strong E1 lines -> list of (A, lam_vac_A, upper, lower, Ju, Jl, tag),
     strongest first."""
@@ -1302,25 +1392,25 @@ def e1_lines(rows, stage=1):
             terms[key] = {"LS": term_LS(term), "odd": is_odd(term), "occ": conf_occ(conf), "levels": [],
                           "key": key}
         terms[key]["levels"].append((r, J))
-    keys, jump_cache, cand = list(terms), {}, []
+    keys, jump_cache, cand, so_pairs = list(terms), {}, [], []
     for i in range(len(keys)):
         for k in range(i + 1, len(keys)):
             t1, t2 = terms[keys[i]], terms[keys[k]]
             if t1["odd"] == t2["odd"]:
                 continue
             note = ""
-            if t1["LS"] and t2["LS"]:
-                (L1, S1), (L2, S2) = t1["LS"], t2["LS"]
-                if abs(S1 - S2) > 1e-9 or abs(L1 - L2) > 1 + 1e-9 or (L1 == 0 and L2 == 0):
-                    continue
-            else:
-                note = " jj"
             ck = (keys[i][0], keys[k][0])
             if ck not in jump_cache:
                 jump_cache[ck] = one_jump(t1["occ"], t2["occ"])
             jp = jump_cache[ck]
             if jp is None:
                 continue
+            if t1["LS"] and t2["LS"]:
+                if not _ls_allowed(t1["LS"], t2["LS"]):
+                    so_pairs.append((keys[i], keys[k], jp))      # LS-forbidden: estimate via mixing
+                    continue
+            else:
+                note = " jj"
             extra_in_2, extra_in_1 = jp
             for r1, J1 in t1["levels"]:
                 for r2, J2 in t2["levels"]:
@@ -1381,6 +1471,7 @@ def e1_lines(rows, stage=1):
         lam = 1.0e8 / (up[3] - lo[3])
         A = 6.670e15 * (2 * ka[1] + 1) / (2 * kb[1] + 1) * f / lam ** 2 * occ * w
         out.append((A, lam, up, lo, Ju, Jl, tag + mark + note))
+    out.extend(_so_lines(terms, so_pairs, elim, zeta))
     out.sort(key=lambda t: -t[0])
     return out
 
@@ -2103,10 +2194,31 @@ def levels_view(win, sym, stage, rows, source, err, force_lines=False):
             if not st["expall"]:
                 st["exp"].clear()
             st["msg"] = "expand all " + ("on" if st["expall"] else "off")
-        elif c == "m":
+        elif c == "m" and n:
+            # cycle: off -> 95% -> 99% -> 100% -> off  (current level, or every level when E is on)
+            key_ = id(view[st["cur"]])
+            lh_ = m1map.get(key_) or []
             i_ = EXP_FRACS.index(OPT["exp_frac"]) if OPT["exp_frac"] in EXP_FRACS else 0
-            OPT["exp_frac"] = EXP_FRACS[(i_ + 1) % len(EXP_FRACS)]
-            st["msg"] = "expanded lines cover %d%% of each level's rate" % round(100 * OPT["exp_frac"])
+            if st["expall"] or key_ in st["exp"]:
+                if i_ + 1 < len(EXP_FRACS):
+                    OPT["exp_frac"] = EXP_FRACS[i_ + 1]
+                    st["msg"] = "expanded lines cover %d%% of each level's rate" % round(100 * OPT["exp_frac"])
+                else:                            # past 100%: collapse, back to 95% for next time
+                    OPT["exp_frac"] = EXP_FRACS[0]
+                    if st["expall"]:
+                        st["expall"] = False
+                        st["exp"].clear()
+                        st["msg"] = "expand all off"
+                    else:
+                        st["exp"].discard(key_)
+                        st["msg"] = "collapsed"
+                    st["sub"] = None
+            elif len(lh_) < 2:
+                st["msg"] = "only one line from this level" if lh_ else "no lines from this level"
+            else:
+                OPT["exp_frac"] = EXP_FRACS[0]
+                st["exp"].add(key_)
+                st["msg"] = "expanded lines cover %d%% of each level's rate" % round(100 * OPT["exp_frac"])
         elif c == "t" and st["mode"]:
             md = st["mode"]
             OPT["cut"][md] = (OPT["cut"][md] + 1) % len(MODES[md]["cuts"])
